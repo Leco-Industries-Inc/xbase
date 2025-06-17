@@ -6,7 +6,7 @@ defmodule Xbase.Parser do
   from binary data using Elixir's efficient binary pattern matching.
   """
 
-  alias Xbase.Types.{Header, FieldDescriptor}
+  alias Xbase.Types.{Header, FieldDescriptor, Record}
 
   @doc """
   Parses a 32-byte DBF header from binary data.
@@ -118,7 +118,165 @@ defmodule Xbase.Parser do
     :file.close(file)
   end
 
+  @doc """
+  Calculates the byte offset for a specific record in the file.
+  
+  ## Parameters
+  - `header` - The DBF header containing file structure information
+  - `record_index` - Zero-based record index
+  
+  ## Returns
+  - The byte offset where the record starts
+  
+  ## Examples
+      iex> header = %Header{header_length: 97, record_length: 25}
+      iex> Xbase.Parser.calculate_record_offset(header, 0)
+      97
+      iex> Xbase.Parser.calculate_record_offset(header, 1)
+      122
+  """
+  def calculate_record_offset(%Header{header_length: header_length, record_length: record_length}, record_index) do
+    header_length + (record_index * record_length)
+  end
+
+  @doc """
+  Validates if a record index is within the valid range for the file.
+  
+  ## Parameters
+  - `header` - The DBF header containing record count
+  - `record_index` - Zero-based record index to validate
+  
+  ## Returns
+  - `true` if the index is valid, `false` otherwise
+  """
+  def is_valid_record_index?(%Header{record_count: record_count}, record_index) 
+      when record_index >= 0 and record_index < record_count do
+    true
+  end
+
+  def is_valid_record_index?(_header, _record_index) do
+    false
+  end
+
+  @doc """
+  Extracts the deletion flag from record data.
+  
+  ## Parameters
+  - `record_binary` - The raw record binary data
+  
+  ## Returns
+  - `{:ok, boolean}` - true if deleted (0x2A), false if active (0x20)
+  - `{:error, reason}` - Error for invalid data
+  """
+  def get_deletion_flag(<<>>) do
+    {:error, :invalid_record_data}
+  end
+
+  def get_deletion_flag(<<deletion_flag, _rest::binary>>) do
+    case deletion_flag do
+      0x20 -> {:ok, false}  # Active record
+      0x2A -> {:ok, true}   # Deleted record
+      _ -> {:ok, false}     # Treat other values as active (defensive)
+    end
+  end
+
+  @doc """
+  Parses record field data according to field descriptors.
+  
+  ## Parameters
+  - `record_data` - Binary data for the record fields (without deletion flag)
+  - `fields` - List of field descriptors
+  
+  ## Returns
+  - `{:ok, %{field_name => parsed_value}}` - Parsed field data
+  - `{:error, reason}` - Parse error
+  """
+  def parse_record_data(record_data, fields) do
+    expected_length = Enum.sum(Enum.map(fields, & &1.length))
+    
+    if byte_size(record_data) != expected_length do
+      {:error, :invalid_record_length}
+    else
+      parse_fields_from_record(record_data, fields, 0, %{})
+    end
+  end
+
+  @doc """
+  Reads a complete record from the DBF file at the specified index.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `record_index` - Zero-based record index
+  
+  ## Returns
+  - `{:ok, %Record{}}` - Successfully parsed record
+  - `{:error, reason}` - Error reading or parsing record
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> {:ok, record} = Xbase.Parser.read_record(dbf, 0)
+      iex> record.data["NAME"]
+      "John Doe"
+  """
+  def read_record(%{header: header, fields: fields, file: file}, record_index) do
+    # Validate record index
+    case is_valid_record_index?(header, record_index) do
+      false ->
+        {:error, :invalid_record_index}
+      true ->
+        # Calculate offset and read record
+        offset = calculate_record_offset(header, record_index)
+        
+        case :file.pread(file, offset, header.record_length) do
+          {:ok, record_binary} ->
+            # Extract deletion flag
+            case get_deletion_flag(record_binary) do
+              {:ok, deleted} ->
+                # Parse field data (skip deletion flag)
+                <<_deletion_flag, field_data::binary>> = record_binary
+                
+                case parse_record_data(field_data, fields) do
+                  {:ok, parsed_data} ->
+                    record = %Record{
+                      data: parsed_data,
+                      deleted: deleted,
+                      raw_data: record_binary
+                    }
+                    {:ok, record}
+                  {:error, reason} ->
+                    {:error, reason}
+                end
+              {:error, reason} ->
+                {:error, reason}
+            end
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
   # Private functions
+
+  defp parse_fields_from_record(_data, [], _offset, acc) do
+    {:ok, acc}
+  end
+
+  defp parse_fields_from_record(data, [field | rest_fields], offset, acc) do
+    field_length = field.length
+    
+    case data do
+      <<_::binary-size(offset), field_data::binary-size(field_length), _::binary>> ->
+        case Xbase.FieldParser.parse(field, field_data) do
+          {:ok, parsed_value} ->
+            updated_acc = Map.put(acc, field.name, parsed_value)
+            parse_fields_from_record(data, rest_fields, offset + field_length, updated_acc)
+          {:error, reason} ->
+            {:error, reason}
+        end
+      _ ->
+        {:error, :invalid_record_length}
+    end
+  end
 
   defp read_and_parse_header(file) do
     case :file.read(file, 32) do

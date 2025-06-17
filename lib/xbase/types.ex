@@ -66,4 +66,25 @@ defmodule Xbase.Types do
       index_field_flag: integer()
     }
   end
+
+  defmodule Record do
+    @moduledoc """
+    DBF record structure containing parsed field data and metadata.
+    
+    Represents a single record from a DBF file with parsed field values,
+    deletion status, and raw binary data for debugging purposes.
+    """
+    
+    defstruct [
+      :data,      # Map of field_name => parsed_value
+      :deleted,   # Boolean indicating if record is deleted
+      :raw_data   # Original binary data for debugging
+    ]
+
+    @type t :: %__MODULE__{
+      data: %{String.t() => any()},
+      deleted: boolean(),
+      raw_data: binary()
+    }
+  end
 end

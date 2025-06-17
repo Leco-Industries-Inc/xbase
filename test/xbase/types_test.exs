@@ -3,6 +3,7 @@ defmodule Xbase.TypesTest do
 
   alias Xbase.Types.Header
   alias Xbase.Types.FieldDescriptor
+  alias Xbase.Types.Record
 
   describe "Header struct" do
     test "has all required fields" do
@@ -65,6 +66,40 @@ defmodule Xbase.TypesTest do
       assert field.type == "C"
       assert field.length == 10
       assert field.decimal_count == 0
+    end
+  end
+
+  describe "Record struct" do
+    test "has all required fields" do
+      record = %Record{}
+      
+      assert Map.has_key?(record, :data)
+      assert Map.has_key?(record, :deleted)
+      assert Map.has_key?(record, :raw_data)
+    end
+
+    test "can be created with parsed data" do
+      data = %{"NAME" => "John Doe", "AGE" => 25, "ACTIVE" => true}
+      record = %Record{
+        data: data,
+        deleted: false,
+        raw_data: <<0x20, "John Doe  ", "25 ", "T">>
+      }
+      
+      assert record.data == data
+      assert record.deleted == false
+      assert record.raw_data == <<0x20, "John Doe  ", "25 ", "T">>
+    end
+
+    test "can represent deleted record" do
+      record = %Record{
+        data: %{"NAME" => "Jane Doe", "AGE" => 30},
+        deleted: true,
+        raw_data: <<0x2A, "Jane Doe  ", "30 ">>
+      }
+      
+      assert record.deleted == true
+      assert record.data["NAME"] == "Jane Doe"
     end
   end
 end

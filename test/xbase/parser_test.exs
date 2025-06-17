@@ -4,6 +4,7 @@ defmodule Xbase.ParserTest do
   alias Xbase.Parser
   alias Xbase.Types.Header
   alias Xbase.Types.FieldDescriptor
+  alias Xbase.Types.Record
 
   describe "parse_header/1" do
     test "parses a valid dBase III header" do
@@ -273,6 +274,198 @@ defmodule Xbase.ParserTest do
     
     # Write the complete DBF file
     File.write!(temp_path, header <> field1 <> field2 <> terminator)
+    
+    temp_path
+  end
+
+  describe "record navigation functions" do
+    test "calculate_record_offset/2 calculates correct offset for record" do
+      header = %Header{header_length: 97, record_length: 25}
+      
+      assert 97 = Parser.calculate_record_offset(header, 0)   # First record
+      assert 122 = Parser.calculate_record_offset(header, 1)  # Second record (97 + 25)
+      assert 147 = Parser.calculate_record_offset(header, 2)  # Third record (97 + 50)
+      assert 172 = Parser.calculate_record_offset(header, 3)  # Fourth record (97 + 75)
+    end
+
+    test "calculate_record_offset/2 handles zero-based indexing" do
+      header = %Header{header_length: 65, record_length: 30}
+      
+      # Record 0 starts immediately after header
+      assert 65 = Parser.calculate_record_offset(header, 0)
+      # Each subsequent record is offset by record_length
+      assert 95 = Parser.calculate_record_offset(header, 1)
+      assert 125 = Parser.calculate_record_offset(header, 2)
+    end
+
+    test "is_valid_record_index?/2 validates record indices" do
+      header = %Header{record_count: 10}
+      
+      assert true == Parser.is_valid_record_index?(header, 0)
+      assert true == Parser.is_valid_record_index?(header, 5)
+      assert true == Parser.is_valid_record_index?(header, 9)  # Last valid record
+      assert false == Parser.is_valid_record_index?(header, 10) # Beyond record count
+      assert false == Parser.is_valid_record_index?(header, -1) # Negative index
+    end
+
+    test "get_deletion_flag/1 extracts deletion status from record data" do
+      active_record = <<0x20, "John Doe  ", "25 ", "T">>  # 0x20 = active
+      deleted_record = <<0x2A, "Jane Doe  ", "30 ", "F">> # 0x2A = deleted
+      
+      assert {:ok, false} = Parser.get_deletion_flag(active_record)
+      assert {:ok, true} = Parser.get_deletion_flag(deleted_record)
+    end
+
+    test "get_deletion_flag/1 returns error for empty data" do
+      assert {:error, :invalid_record_data} = Parser.get_deletion_flag(<<>>)
+    end
+
+    test "parse_record_data/2 parses record fields according to field descriptors" do
+      fields = [
+        %FieldDescriptor{name: "NAME", type: "C", length: 10, decimal_count: 0},
+        %FieldDescriptor{name: "AGE", type: "N", length: 3, decimal_count: 0},
+        %FieldDescriptor{name: "ACTIVE", type: "L", length: 1, decimal_count: 0}
+      ]
+      
+      # Skip deletion flag (first byte) and parse field data
+      record_data = <<"John Doe  ", " 25", "T">>
+      
+      assert {:ok, parsed_data} = Parser.parse_record_data(record_data, fields)
+      assert parsed_data["NAME"] == "John Doe"
+      assert parsed_data["AGE"] == 25
+      assert parsed_data["ACTIVE"] == true
+    end
+
+    test "parse_record_data/2 handles mismatched record length" do
+      fields = [
+        %FieldDescriptor{name: "NAME", type: "C", length: 10, decimal_count: 0}
+      ]
+      
+      short_data = <<"John">>  # Only 4 bytes, expected 10
+      
+      assert {:error, :invalid_record_length} = Parser.parse_record_data(short_data, fields)
+    end
+  end
+
+  describe "read_record/2" do
+    test "reads and parses a complete record" do
+      # Create a DBF file with actual data records
+      temp_path = create_test_dbf_with_data()
+      
+      {:ok, dbf} = Parser.open_dbf(temp_path)
+      
+      # Read first record
+      assert {:ok, record} = Parser.read_record(dbf, 0)
+      assert %Record{} = record
+      assert record.deleted == false
+      assert record.data["NAME"] == "John Doe"
+      assert record.data["AGE"] == 25
+      
+      # Read second record (should be deleted)
+      assert {:ok, record2} = Parser.read_record(dbf, 1)
+      assert record2.deleted == true
+      assert record2.data["NAME"] == "Jane Smith"
+      assert record2.data["AGE"] == 30
+      
+      Parser.close_dbf(dbf)
+      File.rm(temp_path)
+    end
+
+    test "returns error for invalid record index" do
+      temp_path = create_test_dbf_with_data()
+      {:ok, dbf} = Parser.open_dbf(temp_path)
+      
+      # Try to read beyond available records
+      assert {:error, :invalid_record_index} = Parser.read_record(dbf, 10)
+      assert {:error, :invalid_record_index} = Parser.read_record(dbf, -1)
+      
+      Parser.close_dbf(dbf)
+      File.rm(temp_path)
+    end
+
+    test "returns error for file read failure" do
+      temp_path = create_test_dbf_with_data()
+      {:ok, dbf} = Parser.open_dbf(temp_path)
+      
+      # Close the file to simulate read failure
+      Parser.close_dbf(dbf)
+      
+      # Now try to read - should fail
+      assert {:error, _reason} = Parser.read_record(dbf, 0)
+      
+      File.rm(temp_path)
+    end
+  end
+
+  # Helper function to create a test DBF file with actual data records
+  defp create_test_dbf_with_data do
+    temp_path = "/tmp/test_data_#{:rand.uniform(10000)}.dbf"
+    
+    # Create header for 2 records
+    header = <<
+      0x03,           # version (dBase III)
+      124, 12, 17,    # last update: 2024-12-17
+      2::little-32,   # record count: 2 records
+      97::little-16,  # header length: 32 + (2 * 32) + 1 = 97 bytes
+      14::little-16,  # record length: 10 + 3 + 1 (deletion flag) = 14 bytes
+      0::16,          # reserved
+      0x00,           # transaction flag
+      0x00,           # encryption flag
+      0::12*8,        # reserved (12 bytes)
+      0x00,           # MDX flag
+      0x00,           # language driver
+      0::16           # reserved
+    >>
+    
+    # Field 1: NAME (Character, 10 bytes)
+    field1 = <<
+      "NAME", 0, 0, 0, 0, 0, 0, 0,  # name (11 bytes)
+      "C",                           # type
+      0, 0, 0, 0,                   # data address
+      10,                           # length
+      0,                            # decimal count
+      0, 0,                         # reserved
+      0,                            # work area ID
+      0, 0,                         # reserved
+      0,                            # set fields flag
+      0, 0, 0, 0, 0, 0, 0,         # reserved
+      0                             # index field flag
+    >>
+    
+    # Field 2: AGE (Numeric, 3 bytes)
+    field2 = <<
+      "AGE", 0, 0, 0, 0, 0, 0, 0, 0, # name (11 bytes)
+      "N",                           # type
+      0, 0, 0, 0,                   # data address
+      3,                            # length
+      0,                            # decimal count
+      0, 0,                         # reserved
+      0,                            # work area ID
+      0, 0,                         # reserved
+      0,                            # set fields flag
+      0, 0, 0, 0, 0, 0, 0,         # reserved
+      0                             # index field flag
+    >>
+    
+    # Field terminator
+    terminator = <<0x0D>>
+    
+    # Record 1: Active record - John Doe, 25
+    record1 = <<
+      0x20,           # active record flag
+      "John Doe  ",   # NAME field (10 bytes - note extra space)
+      " 25"           # AGE field (3 bytes)
+    >>
+    
+    # Record 2: Deleted record - Jane Smith, 30
+    record2 = <<
+      0x2A,           # deleted record flag
+      "Jane Smith",   # NAME field (10 bytes) 
+      " 30"           # AGE field (3 bytes)
+    >>
+    
+    # Write the complete DBF file with data
+    File.write!(temp_path, header <> field1 <> field2 <> terminator <> record1 <> record2)
     
     temp_path
   end
