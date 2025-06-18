@@ -1918,4 +1918,608 @@ defmodule Xbase.ParserTest do
       Parser.close_dbf(final_dbf)
     end
   end
+
+  describe "batch write operations" do
+    setup do
+      temp_path = "/tmp/test_batch_write_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 20, decimal_count: 0},
+        %FieldDescriptor{name: "SCORE", type: "N", length: 6, decimal_count: 2}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add some initial records for update tests
+      {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 1, "NAME" => "Alice", "SCORE" => 85.50})
+      {:ok, dbf2} = Parser.append_record(dbf1, %{"ID" => 2, "NAME" => "Bob", "SCORE" => 92.25})
+      {:ok, dbf3} = Parser.append_record(dbf2, %{"ID" => 3, "NAME" => "Charlie", "SCORE" => 78.75})
+      
+      Parser.close_dbf(dbf3)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "batch appends multiple records efficiently", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      new_records = [
+        %{"ID" => 4, "NAME" => "Diana", "SCORE" => 88.00},
+        %{"ID" => 5, "NAME" => "Eve", "SCORE" => 95.50},
+        %{"ID" => 6, "NAME" => "Frank", "SCORE" => 82.25}
+      ]
+      
+      assert {:ok, updated_dbf} = Parser.batch_append_records(dbf, new_records)
+      
+      # Verify all records were added
+      assert updated_dbf.header.record_count == 6
+      
+      # Verify content of all records
+      {:ok, all_records} = Parser.read_records(updated_dbf)
+      assert length(all_records) == 6
+      
+      # Check the new records
+      assert Enum.at(all_records, 3)["NAME"] == "Diana"
+      assert Enum.at(all_records, 4)["NAME"] == "Eve"
+      assert Enum.at(all_records, 5)["NAME"] == "Frank"
+      assert Enum.at(all_records, 5)["SCORE"] == 82.25
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "batch updates multiple records by index", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      updates = [
+        {0, %{"SCORE" => 90.00}},
+        {1, %{"NAME" => "Robert", "SCORE" => 95.00}},
+        {2, %{"SCORE" => 85.50}}
+      ]
+      
+      assert {:ok, updated_dbf} = Parser.batch_update_records(dbf, updates)
+      
+      # Verify updates were applied
+      {:ok, records} = Parser.read_records(updated_dbf)
+      
+      assert Enum.at(records, 0)["SCORE"] == 90.00
+      assert Enum.at(records, 0)["NAME"] == "Alice"  # Unchanged
+      
+      assert Enum.at(records, 1)["NAME"] == "Robert"
+      assert Enum.at(records, 1)["SCORE"] == 95.00
+      
+      assert Enum.at(records, 2)["SCORE"] == 85.50
+      assert Enum.at(records, 2)["NAME"] == "Charlie"  # Unchanged
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "batch update with condition function", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Update all records where SCORE < 85
+      condition_fn = fn record_data ->
+        Map.get(record_data, "SCORE") < 85.0
+      end
+      
+      update_data = %{"SCORE" => 85.00}
+      
+      assert {:ok, updated_dbf} = Parser.batch_update_where(dbf, condition_fn, update_data)
+      
+      # Verify only Charlie's record was updated (was 78.75, now 85.00)
+      {:ok, records} = Parser.read_records(updated_dbf)
+      
+      assert Enum.at(records, 0)["SCORE"] == 85.50  # Alice unchanged
+      assert Enum.at(records, 1)["SCORE"] == 92.25  # Bob unchanged  
+      assert Enum.at(records, 2)["SCORE"] == 85.00  # Charlie updated
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "handles empty batch operations gracefully", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Empty batch append
+      assert {:ok, dbf1} = Parser.batch_append_records(dbf, [])
+      assert dbf1.header.record_count == 3  # No change
+      
+      # Empty batch update
+      assert {:ok, dbf2} = Parser.batch_update_records(dbf1, [])
+      assert dbf2.header.record_count == 3  # No change
+      
+      Parser.close_dbf(dbf2)
+    end
+
+    test "validates batch update indices", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Try to update with invalid indices
+      invalid_updates = [
+        {0, %{"SCORE" => 90.00}},
+        {5, %{"SCORE" => 85.00}}  # Index 5 doesn't exist
+      ]
+      
+      assert {:error, :invalid_record_index} = Parser.batch_update_records(dbf, invalid_updates)
+      
+      # Try negative index
+      negative_updates = [
+        {-1, %{"SCORE" => 90.00}}
+      ]
+      
+      assert {:error, :invalid_record_index} = Parser.batch_update_records(dbf, negative_updates)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "batch operations update header timestamp", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      original_timestamp = {dbf.header.last_update_year, dbf.header.last_update_month, dbf.header.last_update_day}
+      
+      # Wait to ensure timestamp difference
+      :timer.sleep(1000)
+      
+      # Perform batch append
+      new_records = [%{"ID" => 4, "NAME" => "Diana", "SCORE" => 88.00}]
+      {:ok, updated_dbf} = Parser.batch_append_records(dbf, new_records)
+      
+      new_timestamp = {updated_dbf.header.last_update_year, updated_dbf.header.last_update_month, updated_dbf.header.last_update_day}
+      
+      # Timestamp should be updated
+      assert new_timestamp >= original_timestamp
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "batch operations work within transactions", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Execute batch operations within transaction
+      result = Parser.transaction(dbf, fn transaction_dbf ->
+        # Batch append
+        new_records = [
+          %{"ID" => 4, "NAME" => "Diana", "SCORE" => 88.00},
+          %{"ID" => 5, "NAME" => "Eve", "SCORE" => 95.50}
+        ]
+        {:ok, dbf1} = Parser.batch_append_records(transaction_dbf, new_records)
+        
+        # Batch update
+        updates = [
+          {0, %{"SCORE" => 90.00}},
+          {1, %{"SCORE" => 95.00}}
+        ]
+        {:ok, dbf2} = Parser.batch_update_records(dbf1, updates)
+        
+        {:ok, dbf2}
+      end)
+      
+      assert {:ok, final_dbf} = result
+      
+      # Verify all operations were committed
+      assert final_dbf.header.record_count == 5
+      {:ok, records} = Parser.read_records(final_dbf)
+      
+      assert length(records) == 5
+      assert Enum.at(records, 0)["SCORE"] == 90.00  # Updated
+      assert Enum.at(records, 1)["SCORE"] == 95.00  # Updated
+      assert Enum.at(records, 3)["NAME"] == "Diana"  # Appended
+      assert Enum.at(records, 4)["NAME"] == "Eve"    # Appended
+      
+      Parser.close_dbf(final_dbf)
+    end
+
+    test "batch append handles field validation", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Try to append records with missing required fields
+      invalid_records = [
+        %{"ID" => 4, "NAME" => "Diana"},  # Missing SCORE
+        %{"NAME" => "Eve", "SCORE" => 95.50}  # Missing ID
+      ]
+      
+      # Should still work by using default values for missing fields
+      assert {:ok, updated_dbf} = Parser.batch_append_records(dbf, invalid_records)
+      
+      {:ok, records} = Parser.read_records(updated_dbf)
+      assert length(records) == 5
+      
+      # Missing SCORE should default to 0
+      assert Enum.at(records, 3)["SCORE"] == 0
+      # Missing ID should default to 0  
+      assert Enum.at(records, 4)["ID"] == 0
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "batch operations are atomic on failure", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      original_count = dbf.header.record_count
+      
+      # Execute transaction that will fail partway through
+      result = Parser.transaction(dbf, fn transaction_dbf ->
+        # This should succeed
+        new_records = [%{"ID" => 4, "NAME" => "Diana", "SCORE" => 88.00}]
+        {:ok, dbf1} = Parser.batch_append_records(transaction_dbf, new_records)
+        
+        # This should fail due to invalid index
+        invalid_updates = [{10, %{"SCORE" => 90.00}}]
+        case Parser.batch_update_records(dbf1, invalid_updates) do
+          {:ok, _} -> {:ok, dbf1}
+          {:error, reason} -> {:error, reason}
+        end
+      end)
+      
+      assert {:error, :invalid_record_index} = result
+      
+      # Verify rollback - no records should have been added
+      {:ok, dbf_after} = Parser.open_dbf(path, [:read, :write])
+      assert dbf_after.header.record_count == original_count
+      
+      Parser.close_dbf(dbf_after)
+    end
+  end
+
+  describe "write conflict detection" do
+    setup do
+      temp_path = "/tmp/test_conflict_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 15, decimal_count: 0},
+        %FieldDescriptor{name: "VALUE", type: "N", length: 8, decimal_count: 2}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add initial records
+      {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 1, "NAME" => "Alice", "VALUE" => 100.00})
+      {:ok, dbf2} = Parser.append_record(dbf1, %{"ID" => 2, "NAME" => "Bob", "VALUE" => 200.00})
+      
+      Parser.close_dbf(dbf2)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "detects concurrent modifications during update", %{path: path} do
+      # Open file in two separate handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Modify through first handle
+      {:ok, _updated_dbf1} = Parser.update_record(dbf1, 0, %{"VALUE" => 150.00})
+      
+      # Try to modify through second handle (should detect conflict)
+      result = Parser.update_record_with_conflict_check(dbf2, 0, %{"VALUE" => 175.00})
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(dbf2)
+    end
+
+    test "allows modifications when no conflict exists", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Normal update should work fine
+      result = Parser.update_record_with_conflict_check(dbf, 0, %{"VALUE" => 125.00})
+      
+      assert {:ok, updated_dbf} = result
+      
+      # Verify the update was applied
+      {:ok, record} = Parser.read_record(updated_dbf, 0)
+      assert record.data["VALUE"] == 125.00
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "detects conflicts in batch operations", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Modify through first handle
+      {:ok, _updated_dbf1} = Parser.append_record(dbf1, %{"ID" => 3, "NAME" => "Charlie", "VALUE" => 300.00})
+      
+      # Try batch update through second handle (should detect conflict)
+      updates = [{0, %{"VALUE" => 111.00}}, {1, %{"VALUE" => 222.00}}]
+      result = Parser.batch_update_records_with_conflict_check(dbf2, updates)
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(dbf2)
+    end
+
+    test "refreshes DBF state when detecting conflicts", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Modify through first handle
+      {:ok, _updated_dbf1} = Parser.append_record(dbf1, %{"ID" => 3, "NAME" => "Charlie", "VALUE" => 300.00})
+      
+      # Refresh second handle to get latest state
+      {:ok, refreshed_dbf2} = Parser.refresh_dbf_state(dbf2)
+      
+      # Verify refreshed state reflects the change
+      assert refreshed_dbf2.header.record_count == 3
+      
+      # Now update should work without conflict
+      result = Parser.update_record_with_conflict_check(refreshed_dbf2, 2, %{"VALUE" => 350.00})
+      assert {:ok, _final_dbf} = result
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(refreshed_dbf2)
+    end
+
+    test "conflict detection works with transactions", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Start transaction on first handle that modifies the file
+      transaction_result = Parser.transaction(dbf1, fn transaction_dbf ->
+        {:ok, dbf_step1} = Parser.append_record(transaction_dbf, %{"ID" => 3, "NAME" => "Charlie", "VALUE" => 300.00})
+        {:ok, dbf_step2} = Parser.update_record(dbf_step1, 0, %{"VALUE" => 111.00})
+        {:ok, dbf_step2}
+      end)
+      
+      assert {:ok, _final_dbf1} = transaction_result
+      
+      # Try to update through second handle (should detect conflict)
+      result = Parser.update_record_with_conflict_check(dbf2, 1, %{"VALUE" => 222.00})
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf2)
+    end
+
+    test "conflict detection in delete operations", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete through first handle
+      {:ok, _updated_dbf1} = Parser.mark_deleted(dbf1, 0)
+      
+      # Try to delete through second handle (should detect conflict)
+      result = Parser.mark_deleted_with_conflict_check(dbf2, 1)
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(dbf2)
+    end
+
+    test "conflict check validates header timestamp", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Simulate external modification by directly updating file header timestamp
+      new_header = %{dbf.header | 
+        last_update_year: 125,
+        last_update_month: 6,
+        last_update_day: 15
+      }
+      
+      # Write the modified header directly to file
+      :ok = Parser.write_header(dbf.file, new_header)
+      
+      # Now try to update - should detect the timestamp mismatch
+      result = Parser.update_record_with_conflict_check(dbf, 0, %{"VALUE" => 999.00})
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "automatic retry with refresh on conflict", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Modify through first handle
+      {:ok, _updated_dbf1} = Parser.update_record(dbf1, 0, %{"VALUE" => 150.00})
+      
+      # Use automatic retry function that should refresh and succeed
+      result = Parser.update_record_with_retry(dbf2, 1, %{"VALUE" => 250.00})
+      
+      assert {:ok, updated_dbf2} = result
+      
+      # Verify the update was applied after refresh
+      {:ok, record} = Parser.read_record(updated_dbf2, 1)
+      assert record.data["VALUE"] == 250.00
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(updated_dbf2)
+    end
+
+    test "conflict detection with pack operation", %{path: path} do
+      # Open file in two handles
+      {:ok, dbf1} = Parser.open_dbf(path, [:read, :write])
+      {:ok, dbf2} = Parser.open_dbf(path, [:read, :write])
+      
+      # Mark record as deleted through first handle
+      {:ok, _updated_dbf1} = Parser.mark_deleted(dbf1, 0)
+      
+      # Try to pack through second handle (should detect conflict)
+      packed_path = "/tmp/test_packed_conflict_#{:rand.uniform(10000)}.dbf"
+      result = Parser.pack_with_conflict_check(dbf2, packed_path)
+      
+      assert {:error, :write_conflict} = result
+      
+      Parser.close_dbf(dbf1)
+      Parser.close_dbf(dbf2)
+      
+      # Clean up potential packed file
+      File.rm(packed_path)
+    end
+  end
+
+  describe "header consistency validation" do
+    test "validates header consistency after record append" do
+      fields = [
+        %FieldDescriptor{name: "NAME", type: "C", length: 20, decimal_count: 0},
+        %FieldDescriptor{name: "AGE", type: "N", length: 3, decimal_count: 0}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Append a record
+      {:ok, updated_dbf} = Parser.append_record(dbf, %{"NAME" => "Test", "AGE" => 25})
+      
+      # Validate header consistency
+      assert :ok = Parser.validate_header_consistency(updated_dbf)
+      
+      # Verify file size matches expected
+      {:ok, file_info} = File.stat(path)
+      expected_size = updated_dbf.header.header_length + 
+                     (updated_dbf.header.record_count * updated_dbf.header.record_length) + 1
+      
+      assert file_info.size == expected_size or file_info.size == expected_size - 1
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "validates header consistency after batch append" do
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "DATA", type: "C", length: 10, decimal_count: 0}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Batch append records
+      records = [
+        %{"ID" => 1, "DATA" => "First"},
+        %{"ID" => 2, "DATA" => "Second"},
+        %{"ID" => 3, "DATA" => "Third"}
+      ]
+      
+      {:ok, updated_dbf} = Parser.batch_append_records(dbf, records)
+      
+      # Validate header consistency
+      assert :ok = Parser.validate_header_consistency(updated_dbf)
+      
+      # Verify record count
+      assert updated_dbf.header.record_count == 3
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "detects header length mismatch" do
+      fields = [
+        %FieldDescriptor{name: "TEST", type: "C", length: 10, decimal_count: 0}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Manually corrupt header length
+      corrupted_header = %{dbf.header | header_length: 100}  # Wrong value
+      corrupted_dbf = %{dbf | header: corrupted_header}
+      
+      # Should detect mismatch
+      assert {:error, {:header_length_mismatch, _, _}} = 
+        Parser.validate_header_consistency(corrupted_dbf)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "detects record length mismatch" do
+      fields = [
+        %FieldDescriptor{name: "DATA", type: "C", length: 50, decimal_count: 0}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Manually corrupt record length
+      corrupted_header = %{dbf.header | record_length: 25}  # Wrong value
+      corrupted_dbf = %{dbf | header: corrupted_header}
+      
+      # Should detect mismatch
+      assert {:error, {:record_length_mismatch, _, _}} = 
+        Parser.validate_header_consistency(corrupted_dbf)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "ensures EOF marker is written after operations" do
+      fields = [
+        %FieldDescriptor{name: "VALUE", type: "N", length: 10, decimal_count: 2}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Append records
+      {:ok, dbf} = Parser.append_record(dbf, %{"VALUE" => 123.45})
+      {:ok, dbf} = Parser.append_record(dbf, %{"VALUE" => 678.90})
+      
+      # Ensure header consistency (includes EOF marker)
+      {:ok, consistent_dbf} = Parser.ensure_header_consistency(dbf)
+      
+      # Read the file and check for EOF marker
+      {:ok, file_content} = File.read(path)
+      _file_size = byte_size(file_content)
+      
+      # EOF marker should be at the expected position
+      expected_eof_pos = consistent_dbf.header.header_length + 
+                        (consistent_dbf.header.record_count * consistent_dbf.header.record_length)
+      
+      # Check that EOF marker (0x1A) is present
+      assert :binary.at(file_content, expected_eof_pos) == 0x1A
+      
+      Parser.close_dbf(consistent_dbf)
+    end
+
+    test "header consistency maintained through pack operation" do
+      fields = [
+        %FieldDescriptor{name: "STATUS", type: "C", length: 10, decimal_count: 0},
+        %FieldDescriptor{name: "COUNT", type: "N", length: 5, decimal_count: 0}
+      ]
+      
+      path = "/tmp/test_header_consistency_#{:rand.uniform(10000)}.dbf"
+      {:ok, dbf} = Parser.create_dbf(path, fields)
+      
+      # Add some records
+      {:ok, dbf} = Parser.append_record(dbf, %{"STATUS" => "ACTIVE", "COUNT" => 1})
+      {:ok, dbf} = Parser.append_record(dbf, %{"STATUS" => "DELETED", "COUNT" => 2})
+      {:ok, dbf} = Parser.append_record(dbf, %{"STATUS" => "ACTIVE", "COUNT" => 3})
+      
+      # Mark middle record as deleted
+      {:ok, dbf} = Parser.mark_deleted(dbf, 1)
+      
+      # Pack the file
+      packed_path = "/tmp/test_packed_header_#{:rand.uniform(10000)}.dbf"
+      {:ok, packed_dbf} = Parser.pack(dbf, packed_path)
+      
+      # Validate packed file header consistency
+      assert :ok = Parser.validate_header_consistency(packed_dbf)
+      
+      # Verify packed file has correct record count (2 active records)
+      assert packed_dbf.header.record_count == 2
+      
+      # Verify file size is correct for packed file
+      {:ok, file_info} = File.stat(packed_path)
+      expected_size = packed_dbf.header.header_length + 
+                     (packed_dbf.header.record_count * packed_dbf.header.record_length) + 1
+      
+      assert file_info.size == expected_size or file_info.size == expected_size - 1
+      
+      Parser.close_dbf(dbf)
+      Parser.close_dbf(packed_dbf)
+    end
+  end
 end

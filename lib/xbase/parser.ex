@@ -333,10 +333,15 @@ defmodule Xbase.Parser do
             # Update header with new record count and timestamp
             updated_header = update_header_for_append(header)
             
-            # Write updated header to file
-            case write_header(file, updated_header) do
+            # Write updated header to file with validation
+            case write_header_with_validation(file, updated_header, fields) do
               :ok ->
-                {:ok, %{dbf | header: updated_header}}
+                updated_dbf = %{dbf | header: updated_header}
+                # Ensure EOF marker is written
+                case write_eof_marker(file, updated_header) do
+                  :ok -> {:ok, updated_dbf}
+                  {:error, reason} -> {:error, reason}
+                end
               {:error, reason} ->
                 {:error, reason}
             end
@@ -672,6 +677,291 @@ defmodule Xbase.Parser do
   end
 
   @doc """
+  Appends multiple records to the DBF file in a single batch operation.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `records` - List of record data maps to append
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully appended all records
+  - `{:error, reason}` - Error during batch append
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> records = [%{"NAME" => "John"}, %{"NAME" => "Jane"}]
+      iex> Xbase.Parser.batch_append_records(dbf, records)
+      {:ok, updated_dbf}
+  """
+  def batch_append_records(dbf, []) do
+    {:ok, dbf}
+  end
+
+  def batch_append_records(%{header: header, fields: fields, file: file} = dbf, records) when is_list(records) do
+    # Encode all records first to validate them
+    case batch_encode_records(fields, records) do
+      {:ok, encoded_records} ->
+        # Calculate starting offset for new records
+        start_offset = calculate_record_offset(header, header.record_count)
+        
+        # Write all records in batch
+        case batch_write_records(file, start_offset, encoded_records) do
+          :ok ->
+            # Update header with new record count and timestamp
+            new_record_count = header.record_count + length(records)
+            updated_header = %{update_header_timestamp(header) | record_count: new_record_count}
+            
+            case write_header_with_validation(file, updated_header, fields) do
+              :ok ->
+                updated_dbf = %{dbf | header: updated_header}
+                # Ensure EOF marker is written
+                case write_eof_marker(file, updated_header) do
+                  :ok -> {:ok, updated_dbf}
+                  {:error, reason} -> {:error, reason}
+                end
+              {:error, reason} ->
+                {:error, reason}
+            end
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Updates multiple records by their indices in a single batch operation.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `updates` - List of {index, update_data} tuples
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully updated all records
+  - `{:error, reason}` - Error during batch update
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> updates = [{0, %{"NAME" => "John"}}, {2, %{"STATUS" => "active"}}]
+      iex> Xbase.Parser.batch_update_records(dbf, updates)
+      {:ok, updated_dbf}
+  """
+  def batch_update_records(dbf, []) do
+    {:ok, dbf}
+  end
+
+  def batch_update_records(%{header: header, fields: fields, file: file} = dbf, updates) when is_list(updates) do
+    # Validate all indices first
+    indices = Enum.map(updates, fn {index, _data} -> index end)
+    case validate_indices(dbf, indices) do
+      :ok ->
+        # Process each update
+        case batch_process_updates(dbf, fields, updates) do
+          {:ok, encoded_updates} ->
+            # Write all updates in batch
+            case batch_write_record_updates(file, encoded_updates) do
+              :ok ->
+                # Update header timestamp
+                updated_header = update_header_timestamp(header)
+                case write_header(file, updated_header) do
+                  :ok ->
+                    {:ok, %{dbf | header: updated_header}}
+                  {:error, reason} ->
+                    {:error, reason}
+                end
+              {:error, reason} ->
+                {:error, reason}
+            end
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Updates records that match a given condition function.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `condition_fn` - Function that takes record data and returns true to update
+  - `update_data` - Map of field updates to apply
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully updated matching records
+  - `{:error, reason}` - Error during batch update
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> condition = fn record -> record["STATUS"] == "pending" end
+      iex> Xbase.Parser.batch_update_where(dbf, condition, %{"STATUS" => "active"})
+      {:ok, updated_dbf}
+  """
+  def batch_update_where(%{header: header} = dbf, condition_fn, update_data) when is_function(condition_fn, 1) do
+    case find_matching_indices(dbf, header.record_count, condition_fn) do
+      {:ok, matching_indices} ->
+        # Convert indices to update tuples
+        updates = Enum.map(matching_indices, fn index -> {index, update_data} end)
+        batch_update_records(dbf, updates)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Refreshes the DBF structure by re-reading the header and fields from file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  
+  ## Returns
+  - `{:ok, refreshed_dbf}` - DBF with updated header and fields
+  - `{:error, reason}` - Error refreshing from file
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> Xbase.Parser.refresh_dbf_state(dbf)
+      {:ok, refreshed_dbf}
+  """
+  def refresh_dbf_state(%{file: file, file_path: file_path} = _dbf) do
+    case read_and_parse_header(file) do
+      {:ok, header} ->
+        case read_and_parse_fields(file, header) do
+          {:ok, fields} ->
+            {:ok, %{header: header, fields: fields, file: file, file_path: file_path}}
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Updates a record with write conflict detection.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `record_index` - Index of record to update
+  - `update_data` - Map of field updates
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully updated record
+  - `{:error, :write_conflict}` - File was modified by another process
+  - `{:error, reason}` - Other error during update
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> Xbase.Parser.update_record_with_conflict_check(dbf, 0, %{"NAME" => "John"})
+      {:ok, updated_dbf}
+  """
+  def update_record_with_conflict_check(dbf, record_index, update_data) do
+    case check_for_write_conflict(dbf) do
+      :ok ->
+        update_record(dbf, record_index, update_data)
+      {:error, :write_conflict} ->
+        {:error, :write_conflict}
+    end
+  end
+
+  @doc """
+  Updates multiple records with write conflict detection.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `updates` - List of {index, update_data} tuples
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully updated records
+  - `{:error, :write_conflict}` - File was modified by another process
+  - `{:error, reason}` - Other error during batch update
+  """
+  def batch_update_records_with_conflict_check(dbf, updates) do
+    case check_for_write_conflict(dbf) do
+      :ok ->
+        batch_update_records(dbf, updates)
+      {:error, :write_conflict} ->
+        {:error, :write_conflict}
+    end
+  end
+
+  @doc """
+  Marks a record as deleted with write conflict detection.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `record_index` - Index of record to delete
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully marked record as deleted
+  - `{:error, :write_conflict}` - File was modified by another process
+  - `{:error, reason}` - Other error during deletion
+  """
+  def mark_deleted_with_conflict_check(dbf, record_index) do
+    case check_for_write_conflict(dbf) do
+      :ok ->
+        mark_deleted(dbf, record_index)
+      {:error, :write_conflict} ->
+        {:error, :write_conflict}
+    end
+  end
+
+  @doc """
+  Packs a DBF file with write conflict detection.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `output_path` - Path for the packed file
+  
+  ## Returns
+  - `{:ok, packed_dbf}` - Successfully packed file
+  - `{:error, :write_conflict}` - File was modified by another process
+  - `{:error, reason}` - Other error during packing
+  """
+  def pack_with_conflict_check(dbf, output_path) do
+    case check_for_write_conflict(dbf) do
+      :ok ->
+        pack(dbf, output_path)
+      {:error, :write_conflict} ->
+        {:error, :write_conflict}
+    end
+  end
+
+  @doc """
+  Updates a record with automatic retry on conflict detection.
+  
+  This function automatically refreshes the DBF state if a write conflict
+  is detected and retries the operation once.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `record_index` - Index of record to update
+  - `update_data` - Map of field updates
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully updated record
+  - `{:error, reason}` - Error during update (after retry if conflict occurred)
+  """
+  def update_record_with_retry(dbf, record_index, update_data) do
+    case update_record_with_conflict_check(dbf, record_index, update_data) do
+      {:ok, updated_dbf} ->
+        {:ok, updated_dbf}
+      {:error, :write_conflict} ->
+        # Refresh and retry once
+        case refresh_dbf_state(dbf) do
+          {:ok, refreshed_dbf} ->
+            update_record(refreshed_dbf, record_index, update_data)
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
   Executes a transaction function with rollback capability.
   
   ## Parameters
@@ -800,8 +1090,8 @@ defmodule Xbase.Parser do
     field_binaries = Enum.map(fields, &build_field_descriptor/1)
     fields_binary = Enum.join(field_binaries) <> <<0x0D>>  # Add terminator
     
-    # Write complete file
-    complete_binary = header_binary <> fields_binary
+    # Write complete file with EOF marker
+    complete_binary = header_binary <> fields_binary <> <<0x1A>>
     
     case :file.open(path, [:write, :read, :binary, :random]) do
       {:ok, file} ->
@@ -1027,7 +1317,7 @@ defmodule Xbase.Parser do
     }
   end
 
-  defp write_header(file, header) do
+  def write_header(file, header) do
     header_binary = <<
       header.version,
       header.last_update_year,
@@ -1198,6 +1488,135 @@ defmodule Xbase.Parser do
     end
   end
 
+  defp check_for_write_conflict(%{header: cached_header, file: file, file_path: file_path} = _dbf) do
+    # Save current file position
+    {:ok, current_pos} = :file.position(file, :cur)
+    
+    # Check file modification time as a more precise conflict detection
+    case File.stat(file_path) do
+      {:ok, %File.Stat{mtime: _current_mtime}} ->
+        # Get the file modification time from when we opened the DBF
+        # For this implementation, we'll use header comparison as a fallback
+        # Re-read header from file to check for modifications
+        :file.position(file, 0)  # Go to start of file
+        
+        result = case :file.read(file, 32) do
+          {:ok, header_binary} ->
+            case parse_header(header_binary) do
+              {:ok, current_header} ->
+                # For update operations that don't change record count,
+                # use a stricter comparison including all header fields
+                if headers_match_exactly(cached_header, current_header) do
+                  :ok
+                else
+                  {:error, :write_conflict}
+                end
+              {:error, _reason} ->
+                # If we can't parse the header, assume a write conflict occurred
+                {:error, :write_conflict}
+            end
+          {:error, _reason} ->
+            # If we can't read the header, assume a write conflict occurred
+            {:error, :write_conflict}
+        end
+        
+        # Restore file position
+        :file.position(file, current_pos)
+        result
+      {:error, _reason} ->
+        # If we can't get file stats, assume a write conflict occurred
+        {:error, :write_conflict}
+    end
+  end
+
+  defp headers_match_exactly(cached_header, current_header) do
+    cached_header.version == current_header.version and
+    cached_header.last_update_year == current_header.last_update_year and
+    cached_header.last_update_month == current_header.last_update_month and
+    cached_header.last_update_day == current_header.last_update_day and
+    cached_header.record_count == current_header.record_count and
+    cached_header.header_length == current_header.header_length and
+    cached_header.record_length == current_header.record_length and
+    cached_header.transaction_flag == current_header.transaction_flag and
+    cached_header.encryption_flag == current_header.encryption_flag and
+    cached_header.mdx_flag == current_header.mdx_flag and
+    cached_header.language_driver == current_header.language_driver
+  end
+
+  defp batch_encode_records(fields, records) do
+    batch_encode_records_recursive(fields, records, [])
+  end
+
+  defp batch_encode_records_recursive(_fields, [], acc) do
+    {:ok, Enum.reverse(acc)}
+  end
+
+  defp batch_encode_records_recursive(fields, [record | rest], acc) do
+    case encode_record(fields, record) do
+      {:ok, encoded_record} ->
+        batch_encode_records_recursive(fields, rest, [encoded_record | acc])
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp batch_write_records(file, start_offset, encoded_records) do
+    # Concatenate all encoded records into one binary
+    all_records_binary = Enum.join(encoded_records)
+    
+    # Write all records in one operation
+    :file.pwrite(file, start_offset, all_records_binary)
+  end
+
+  defp batch_process_updates(dbf, fields, updates) do
+    batch_process_updates_recursive(dbf, fields, updates, [])
+  end
+
+  defp batch_process_updates_recursive(_dbf, _fields, [], acc) do
+    {:ok, Enum.reverse(acc)}
+  end
+
+  defp batch_process_updates_recursive(dbf, fields, [{index, update_data} | rest], acc) do
+    # Read current record to merge with update
+    case read_record(dbf, index) do
+      {:ok, current_record} ->
+        # Merge update data with existing record data
+        merged_data = Map.merge(current_record.data, update_data)
+        
+        # Encode the merged record
+        case encode_record(fields, merged_data) do
+          {:ok, encoded_record} ->
+            # Calculate offset for this record
+            offset = calculate_record_offset(dbf.header, index)
+            
+            # Add to accumulator as {offset, encoded_data}
+            update_entry = {offset, encoded_record}
+            batch_process_updates_recursive(dbf, fields, rest, [update_entry | acc])
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp batch_write_record_updates(file, encoded_updates) do
+    batch_write_record_updates_recursive(file, encoded_updates)
+  end
+
+  defp batch_write_record_updates_recursive(_file, []) do
+    :ok
+  end
+
+  defp batch_write_record_updates_recursive(file, [{offset, data} | rest]) do
+    case :file.pwrite(file, offset, data) do
+      :ok ->
+        batch_write_record_updates_recursive(file, rest)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp validate_indices(%{header: header}, indices) do
     invalid_indices = Enum.filter(indices, fn index ->
       index < 0 or index >= header.record_count
@@ -1319,6 +1738,97 @@ defmodule Xbase.Parser do
         File.rm(backup_path)
         :ok
       {:error, reason} -> 
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Validates header consistency after write operations.
+  
+  ## Parameters
+  - `dbf` - DBF file structure
+  
+  ## Returns
+  - `:ok` - Header is consistent
+  - `{:error, reason}` - Header inconsistency detected
+  """
+  def validate_header_consistency(%{header: header, fields: fields, file: file} = _dbf) do
+    # Calculate expected header values
+    field_count = length(fields)
+    expected_header_length = 32 + (field_count * 32) + 1
+    expected_record_length = 1 + Enum.sum(Enum.map(fields, & &1.length))
+    
+    # Verify header calculations match
+    cond do
+      header.header_length != expected_header_length ->
+        {:error, {:header_length_mismatch, expected_header_length, header.header_length}}
+        
+      header.record_length != expected_record_length ->
+        {:error, {:record_length_mismatch, expected_record_length, header.record_length}}
+        
+      true ->
+        # Verify file size matches expected size based on header
+        case :file.position(file, :eof) do
+          {:ok, file_size} ->
+            expected_size = header.header_length + (header.record_count * header.record_length) + 1  # +1 for EOF marker
+            
+            if file_size == expected_size or file_size == expected_size - 1 do  # Allow missing EOF marker
+              :ok
+            else
+              {:error, {:file_size_mismatch, expected: expected_size, actual: file_size}}
+            end
+            
+          {:error, reason} ->
+            {:error, {:file_position_error, reason}}
+        end
+    end
+  end
+
+  # Enhanced write_header with validation
+  defp write_header_with_validation(file, header, fields) do
+    case write_header(file, header) do
+      :ok ->
+        # Validate the header after writing
+        case validate_header_consistency(%{header: header, fields: fields, file: file}) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:header_validation_failed, reason}}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Write EOF marker (0x1A) at the end of the file
+  defp write_eof_marker(file, header) do
+    # Calculate where EOF marker should be
+    eof_position = header.header_length + (header.record_count * header.record_length)
+    
+    case :file.pwrite(file, eof_position, <<0x1A>>) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:eof_marker_write_failed, reason}}
+    end
+  end
+
+  @doc """
+  Ensures header consistency for all write operations.
+  Call this after any operation that modifies the DBF structure.
+  
+  ## Parameters
+  - `dbf` - DBF file structure
+  
+  ## Returns
+  - `{:ok, dbf}` - Header is consistent
+  - `{:error, reason}` - Header inconsistency detected
+  """
+  def ensure_header_consistency(%{header: header, fields: _fields, file: file} = dbf) do
+    case validate_header_consistency(dbf) do
+      :ok -> 
+        # Also ensure EOF marker is present
+        case write_eof_marker(file, header) do
+          :ok -> {:ok, dbf}
+          {:error, reason} -> {:error, reason}
+        end
+      {:error, reason} ->
         {:error, reason}
     end
   end
