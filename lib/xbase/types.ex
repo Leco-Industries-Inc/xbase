@@ -129,4 +129,114 @@ defmodule Xbase.Types do
       file_path: String.t()
     }
   end
+
+  defmodule CdxHeader do
+    @moduledoc """
+    CDX index file header structure containing metadata about the index file.
+    
+    The header is a 512-byte structure at the beginning of every CDX file,
+    containing information about the B-tree root and index configuration.
+    """
+    
+    defstruct [
+      :root_node,         # Pointer to root node (page number)
+      :free_list,         # Pointer to free list (-1 if empty)
+      :version,           # Version number
+      :key_length,        # Length of index key
+      :index_options,     # Index options flags
+      :signature,         # Index signature
+      :sort_order,        # Sort order specification
+      :total_expr_len,    # Total expression length
+      :for_expr_len,      # FOR expression length
+      :key_expr_len,      # Key expression length
+      :key_expression,    # Key expression string
+      :for_expression     # FOR expression string (optional)
+    ]
+
+    @type t :: %__MODULE__{
+      root_node: non_neg_integer(),
+      free_list: integer(),
+      version: non_neg_integer(),
+      key_length: pos_integer(),
+      index_options: integer(),
+      signature: integer(),
+      sort_order: integer(),
+      total_expr_len: non_neg_integer(),
+      for_expr_len: non_neg_integer(),
+      key_expr_len: non_neg_integer(),
+      key_expression: String.t(),
+      for_expression: String.t() | nil
+    }
+  end
+
+  defmodule CdxNode do
+    @moduledoc """
+    CDX B-tree node structure representing a page in the index tree.
+    
+    Each node is 512 bytes and can be a root, branch, or leaf node
+    containing keys and pointers for B-tree navigation.
+    """
+    
+    defstruct [
+      :attributes,        # Node attributes (root/branch/leaf flags)
+      :key_count,         # Number of keys in this node
+      :left_brother,      # Pointer to left brother node (-1 if none)
+      :keys,              # List of keys in this node
+      :pointers,          # List of pointers (to child nodes or records)
+      :node_type          # :root, :branch, or :leaf
+    ]
+
+    @type t :: %__MODULE__{
+      attributes: integer(),
+      key_count: non_neg_integer(),
+      left_brother: integer(),
+      keys: [binary()],
+      pointers: [integer()],
+      node_type: :root | :branch | :leaf
+    }
+  end
+
+  defmodule CdxFile do
+    @moduledoc """
+    CDX file structure containing header information and file handle.
+    
+    Represents an opened CDX index file with parsed header and file descriptor
+    for reading B-tree nodes and performing index operations.
+    """
+    
+    defstruct [
+      :header,      # CdxHeader structure
+      :file,        # File handle from :file.open
+      :file_path,   # Path to the CDX file
+      :page_cache   # ETS table for caching frequently accessed pages
+    ]
+
+    @type t :: %__MODULE__{
+      header: CdxHeader.t(),
+      file: :file.io_device(),
+      file_path: String.t(),
+      page_cache: :ets.tid() | nil
+    }
+  end
+
+  defmodule IndexKey do
+    @moduledoc """
+    Index key structure representing a key-value pair in a CDX index.
+    
+    Contains the index key data and associated record pointer for
+    B-tree operations and record lookups.
+    """
+    
+    defstruct [
+      :key_data,      # Binary key data
+      :record_number, # Record number this key points to
+      :key_type      # Type of key (:character, :numeric, :date, :logical)
+    ]
+
+    @type t :: %__MODULE__{
+      key_data: binary(),
+      record_number: non_neg_integer(),
+      key_type: :character | :numeric | :date | :logical
+    }
+  end
 end
