@@ -1375,4 +1375,547 @@ defmodule Xbase.ParserTest do
       Parser.close_dbf(packed_dbf)
     end
   end
+
+  describe "transaction/2" do
+    setup do
+      # Create a test DBF file with some records
+      temp_path = "/tmp/test_transaction_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 20, decimal_count: 0},
+        %FieldDescriptor{name: "BALANCE", type: "N", length: 10, decimal_count: 2}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add some initial records
+      {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 1, "NAME" => "Alice", "BALANCE" => 100.00})
+      {:ok, dbf2} = Parser.append_record(dbf1, %{"ID" => 2, "NAME" => "Bob", "BALANCE" => 200.00})
+      {:ok, dbf3} = Parser.append_record(dbf2, %{"ID" => 3, "NAME" => "Charlie", "BALANCE" => 300.00})
+      
+      Parser.close_dbf(dbf3)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "commits successful transaction", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Execute transaction that succeeds
+      result = Parser.transaction(dbf, fn dbf ->
+        {:ok, dbf1} = Parser.update_record(dbf, 0, %{"BALANCE" => 150.00})
+        {:ok, dbf2} = Parser.update_record(dbf1, 1, %{"BALANCE" => 250.00})
+        {:ok, dbf3} = Parser.append_record(dbf2, %{"ID" => 4, "NAME" => "Diana", "BALANCE" => 400.00})
+        {:ok, dbf3}
+      end)
+      
+      assert {:ok, final_dbf} = result
+      
+      # Verify changes were committed
+      {:ok, records} = Parser.read_records(final_dbf)
+      assert length(records) == 4
+      assert Enum.at(records, 0)["BALANCE"] == 150.00
+      assert Enum.at(records, 1)["BALANCE"] == 250.00
+      assert Enum.at(records, 3)["NAME"] == "Diana"
+      
+      # Verify changes persist after reopening
+      Parser.close_dbf(final_dbf)
+      {:ok, dbf_reopen} = Parser.open_dbf(path)
+      {:ok, records_reopen} = Parser.read_records(dbf_reopen)
+      assert length(records_reopen) == 4
+      assert Enum.at(records_reopen, 0)["BALANCE"] == 150.00
+      
+      Parser.close_dbf(dbf_reopen)
+    end
+
+    test "rolls back failed transaction", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Get original state
+      {:ok, original_records} = Parser.read_records(dbf)
+      original_count = length(original_records)
+      original_balance = Enum.at(original_records, 0)["BALANCE"]
+      
+      # Execute transaction that fails
+      result = Parser.transaction(dbf, fn dbf ->
+        {:ok, dbf1} = Parser.update_record(dbf, 0, %{"BALANCE" => 999.99})
+        {:ok, _dbf2} = Parser.append_record(dbf1, %{"ID" => 4, "NAME" => "Diana"})
+        # Simulate an error
+        {:error, :simulated_failure}
+      end)
+      
+      assert {:error, :simulated_failure} = result
+      
+      # Verify rollback occurred - file should be in original state
+      {:ok, dbf_after} = Parser.open_dbf(path)
+      {:ok, records_after} = Parser.read_records(dbf_after)
+      
+      assert length(records_after) == original_count
+      assert Enum.at(records_after, 0)["BALANCE"] == original_balance
+      # Diana should not exist
+      names = Enum.map(records_after, & &1["NAME"])
+      refute "Diana" in names
+      
+      Parser.close_dbf(dbf_after)
+    end
+
+    test "handles exception in transaction", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Get original state
+      {:ok, original_records} = Parser.read_records(dbf)
+      original_count = length(original_records)
+      
+      # Execute transaction that raises exception
+      result = Parser.transaction(dbf, fn dbf ->
+        {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 4, "NAME" => "Diana"})
+        # Simulate an exception
+        raise RuntimeError, "Something went wrong"
+        {:ok, dbf1}
+      end)
+      
+      assert {:error, %RuntimeError{}} = result
+      
+      # Verify rollback occurred
+      {:ok, dbf_after} = Parser.open_dbf(path)
+      {:ok, records_after} = Parser.read_records(dbf_after)
+      
+      assert length(records_after) == original_count
+      names = Enum.map(records_after, & &1["NAME"])
+      refute "Diana" in names
+      
+      Parser.close_dbf(dbf_after)
+    end
+
+    test "handles nested operations correctly", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Complex transaction with multiple operations
+      result = Parser.transaction(dbf, fn dbf ->
+        # Add a record
+        {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 4, "NAME" => "Diana", "BALANCE" => 400.00})
+        
+        # Update existing records
+        {:ok, dbf2} = Parser.update_record(dbf1, 0, %{"BALANCE" => 111.11})
+        {:ok, dbf3} = Parser.update_record(dbf2, 1, %{"BALANCE" => 222.22})
+        
+        # Mark one as deleted
+        {:ok, dbf4} = Parser.mark_deleted(dbf3, 2)
+        
+        # Add another record
+        {:ok, dbf5} = Parser.append_record(dbf4, %{"ID" => 5, "NAME" => "Eve", "BALANCE" => 500.00})
+        
+        {:ok, dbf5}
+      end)
+      
+      assert {:ok, final_dbf} = result
+      
+      # Verify all operations were applied
+      {:ok, records} = Parser.read_records(final_dbf)
+      assert length(records) == 4  # 3 original + 2 new - 1 deleted
+      
+      # Verify specific changes
+      assert Enum.at(records, 0)["BALANCE"] == 111.11
+      assert Enum.at(records, 1)["BALANCE"] == 222.22
+      # Charlie should be missing (deleted)
+      names = Enum.map(records, & &1["NAME"])
+      assert "Diana" in names
+      assert "Eve" in names
+      refute "Charlie" in names
+      
+      Parser.close_dbf(final_dbf)
+    end
+
+    test "cleans up backup file on successful commit", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Execute successful transaction
+      {:ok, _final_dbf} = Parser.transaction(dbf, fn dbf ->
+        {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 4, "NAME" => "Diana"})
+        {:ok, dbf1}
+      end)
+      
+      # Backup file should be cleaned up
+      backup_path = path <> ".backup"
+      refute File.exists?(backup_path)
+    end
+
+    test "handles transaction with no operations", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Transaction that does nothing
+      result = Parser.transaction(dbf, fn dbf ->
+        {:ok, dbf}
+      end)
+      
+      assert {:ok, final_dbf} = result
+      
+      # File should be unchanged
+      {:ok, records} = Parser.read_records(final_dbf)
+      assert length(records) == 3
+      
+      Parser.close_dbf(final_dbf)
+    end
+
+    test "handles invalid return from transaction function", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Transaction that returns invalid result
+      result = Parser.transaction(dbf, fn _dbf ->
+        :invalid_return
+      end)
+      
+      assert {:error, :invalid_transaction_return} = result
+      
+      # File should be rolled back to original state
+      {:ok, dbf_after} = Parser.open_dbf(path)
+      {:ok, records} = Parser.read_records(dbf_after)
+      assert length(records) == 3  # Original state
+      
+      Parser.close_dbf(dbf_after)
+    end
+  end
+
+  describe "record counting" do
+    setup do
+      temp_path = "/tmp/test_counting_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 15, decimal_count: 0}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add some test records
+      {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 1, "NAME" => "Alice"})
+      {:ok, dbf2} = Parser.append_record(dbf1, %{"ID" => 2, "NAME" => "Bob"})
+      {:ok, dbf3} = Parser.append_record(dbf2, %{"ID" => 3, "NAME" => "Charlie"})
+      {:ok, dbf4} = Parser.append_record(dbf3, %{"ID" => 4, "NAME" => "Diana"})
+      
+      Parser.close_dbf(dbf4)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "counts active records correctly", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Initially all records are active
+      assert {:ok, 4} = Parser.count_active_records(dbf)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "counts deleted records correctly", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Initially no records are deleted
+      assert {:ok, 0} = Parser.count_deleted_records(dbf)
+      
+      # Delete some records
+      {:ok, dbf1} = Parser.mark_deleted(dbf, 1)
+      {:ok, dbf2} = Parser.mark_deleted(dbf1, 3)
+      
+      # Now we should have 2 deleted records
+      assert {:ok, 2} = Parser.count_deleted_records(dbf2)
+      
+      Parser.close_dbf(dbf2)
+    end
+
+    test "provides accurate record statistics", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Mark some records as deleted
+      {:ok, dbf1} = Parser.mark_deleted(dbf, 0)
+      {:ok, dbf2} = Parser.mark_deleted(dbf1, 2)
+      
+      # Get statistics
+      assert {:ok, stats} = Parser.record_statistics(dbf2)
+      
+      assert stats.total_records == 4
+      assert stats.active_records == 2
+      assert stats.deleted_records == 2
+      assert stats.deletion_percentage == 50.0
+      
+      Parser.close_dbf(dbf2)
+    end
+
+    test "handles empty file statistics", %{path: _path} do
+      empty_path = "/tmp/test_empty_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(empty_path, fields)
+      
+      # Get statistics for empty file
+      assert {:ok, stats} = Parser.record_statistics(dbf)
+      
+      assert stats.total_records == 0
+      assert stats.active_records == 0
+      assert stats.deleted_records == 0
+      assert stats.deletion_percentage == 0.0
+      
+      Parser.close_dbf(dbf)
+      File.rm(empty_path)
+    end
+
+    test "updates counts after undelete operations", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete some records
+      {:ok, dbf1} = Parser.mark_deleted(dbf, 0)
+      {:ok, dbf2} = Parser.mark_deleted(dbf1, 1)
+      {:ok, dbf3} = Parser.mark_deleted(dbf2, 2)
+      
+      # Verify deleted count
+      assert {:ok, 3} = Parser.count_deleted_records(dbf3)
+      assert {:ok, 1} = Parser.count_active_records(dbf3)
+      
+      # Undelete one record
+      {:ok, dbf4} = Parser.undelete_record(dbf3, 1)
+      
+      # Verify updated counts
+      assert {:ok, 2} = Parser.count_deleted_records(dbf4)
+      assert {:ok, 2} = Parser.count_active_records(dbf4)
+      
+      Parser.close_dbf(dbf4)
+    end
+
+    test "counts are consistent with pack operations", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete some records  
+      {:ok, dbf1} = Parser.mark_deleted(dbf, 1)
+      {:ok, dbf2} = Parser.mark_deleted(dbf1, 3)
+      
+      # Count before packing
+      assert {:ok, 2} = Parser.count_active_records(dbf2)
+      assert {:ok, 2} = Parser.count_deleted_records(dbf2)
+      
+      # Pack the file
+      packed_path = "/tmp/test_packed_#{:rand.uniform(10000)}.dbf"
+      {:ok, packed_dbf} = Parser.pack(dbf2, packed_path)
+      
+      # After packing, should have only active records
+      assert {:ok, 2} = Parser.count_active_records(packed_dbf)
+      assert {:ok, 0} = Parser.count_deleted_records(packed_dbf)
+      
+      Parser.close_dbf(dbf2)
+      Parser.close_dbf(packed_dbf)
+      File.rm(packed_path)
+    end
+  end
+
+  describe "batch deletion" do
+    setup do
+      temp_path = "/tmp/test_batch_delete_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 15, decimal_count: 0},
+        %FieldDescriptor{name: "STATUS", type: "C", length: 10, decimal_count: 0}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add test records
+      {:ok, dbf1} = Parser.append_record(dbf, %{"ID" => 1, "NAME" => "Alice", "STATUS" => "active"})
+      {:ok, dbf2} = Parser.append_record(dbf1, %{"ID" => 2, "NAME" => "Bob", "STATUS" => "inactive"})
+      {:ok, dbf3} = Parser.append_record(dbf2, %{"ID" => 3, "NAME" => "Charlie", "STATUS" => "active"})
+      {:ok, dbf4} = Parser.append_record(dbf3, %{"ID" => 4, "NAME" => "Diana", "STATUS" => "pending"})
+      {:ok, dbf5} = Parser.append_record(dbf4, %{"ID" => 5, "NAME" => "Eve", "STATUS" => "active"})
+      {:ok, dbf6} = Parser.append_record(dbf5, %{"ID" => 6, "NAME" => "Frank", "STATUS" => "inactive"})
+      
+      Parser.close_dbf(dbf6)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "deletes multiple records by index list", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete records at indices 1, 3, and 5
+      assert {:ok, updated_dbf} = Parser.batch_delete(dbf, [1, 3, 5])
+      
+      # Verify deletions
+      assert {:ok, 3} = Parser.count_active_records(updated_dbf)
+      assert {:ok, 3} = Parser.count_deleted_records(updated_dbf)
+      
+      # Verify specific records are deleted
+      {:ok, record1} = Parser.read_record(updated_dbf, 1)
+      assert record1.deleted == true
+      
+      {:ok, record3} = Parser.read_record(updated_dbf, 3)
+      assert record3.deleted == true
+      
+      {:ok, record5} = Parser.read_record(updated_dbf, 5)
+      assert record5.deleted == true
+      
+      # Verify non-deleted records remain active
+      {:ok, record0} = Parser.read_record(updated_dbf, 0)
+      assert record0.deleted == false
+      
+      {:ok, record2} = Parser.read_record(updated_dbf, 2)
+      assert record2.deleted == false
+      
+      {:ok, record4} = Parser.read_record(updated_dbf, 4)
+      assert record4.deleted == false
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "deletes records matching condition function", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete all records where STATUS is "inactive"
+      condition_fn = fn record_data ->
+        Map.get(record_data, "STATUS") == "inactive"
+      end
+      
+      assert {:ok, updated_dbf} = Parser.batch_delete_where(dbf, condition_fn)
+      
+      # Should have deleted 2 records (Bob and Frank with "inactive" status)
+      assert {:ok, 4} = Parser.count_active_records(updated_dbf)
+      assert {:ok, 2} = Parser.count_deleted_records(updated_dbf)
+      
+      # Verify correct records were deleted by checking remaining active records
+      {:ok, active_records} = Parser.read_records(updated_dbf)
+      active_names = Enum.map(active_records, & &1["NAME"])
+      assert "Alice" in active_names
+      assert "Charlie" in active_names  
+      assert "Diana" in active_names
+      assert "Eve" in active_names
+      refute "Bob" in active_names
+      refute "Frank" in active_names
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "deletes records in index range", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete records from index 2 to 4 (inclusive)
+      assert {:ok, updated_dbf} = Parser.batch_delete_range(dbf, 2, 4)
+      
+      # Should have deleted 3 records (indices 2, 3, 4)
+      assert {:ok, 3} = Parser.count_active_records(updated_dbf)
+      assert {:ok, 3} = Parser.count_deleted_records(updated_dbf)
+      
+      # Verify specific deletions
+      {:ok, record2} = Parser.read_record(updated_dbf, 2)
+      assert record2.deleted == true
+      
+      {:ok, record3} = Parser.read_record(updated_dbf, 3)
+      assert record3.deleted == true
+      
+      {:ok, record4} = Parser.read_record(updated_dbf, 4)
+      assert record4.deleted == true
+      
+      # Verify records outside range remain active
+      {:ok, record0} = Parser.read_record(updated_dbf, 0)
+      assert record0.deleted == false
+      
+      {:ok, record1} = Parser.read_record(updated_dbf, 1)
+      assert record1.deleted == false
+      
+      {:ok, record5} = Parser.read_record(updated_dbf, 5)
+      assert record5.deleted == false
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "handles empty index list gracefully", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete with empty list should not change anything
+      assert {:ok, updated_dbf} = Parser.batch_delete(dbf, [])
+      
+      # All records should remain active
+      assert {:ok, 6} = Parser.count_active_records(updated_dbf)
+      assert {:ok, 0} = Parser.count_deleted_records(updated_dbf)
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "handles duplicate indices in batch delete", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Delete with duplicate indices should work (idempotent)
+      assert {:ok, updated_dbf} = Parser.batch_delete(dbf, [1, 3, 1, 3, 1])
+      
+      # Should have deleted only 2 unique records
+      assert {:ok, 4} = Parser.count_active_records(updated_dbf)
+      assert {:ok, 2} = Parser.count_deleted_records(updated_dbf)
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "validates index bounds in batch operations", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Try to delete with invalid indices
+      assert {:error, :invalid_record_index} = Parser.batch_delete(dbf, [0, 1, 10])  # Index 10 is out of bounds
+      assert {:error, :invalid_record_index} = Parser.batch_delete(dbf, [-1, 2])     # Negative index
+      
+      # Try invalid range
+      assert {:error, :invalid_range} = Parser.batch_delete_range(dbf, 3, 2)  # Start > end
+      assert {:error, :invalid_record_index} = Parser.batch_delete_range(dbf, 0, 10)  # End out of bounds
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "batch delete updates header timestamp", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      original_timestamp = {dbf.header.last_update_year, dbf.header.last_update_month, dbf.header.last_update_day}
+      
+      # Wait a moment to ensure timestamp difference
+      :timer.sleep(1000)
+      
+      # Perform batch deletion
+      {:ok, updated_dbf} = Parser.batch_delete(dbf, [1, 2])
+      
+      new_timestamp = {updated_dbf.header.last_update_year, updated_dbf.header.last_update_month, updated_dbf.header.last_update_day}
+      
+      # Timestamp should be updated (at least not identical due to sleep)
+      assert new_timestamp >= original_timestamp
+      
+      Parser.close_dbf(updated_dbf)
+    end
+
+    test "batch operations work within transactions", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Execute batch deletion within a transaction
+      result = Parser.transaction(dbf, fn transaction_dbf ->
+        {:ok, dbf1} = Parser.batch_delete(transaction_dbf, [0, 2, 4])
+        {:ok, dbf2} = Parser.batch_delete_range(dbf1, 1, 1)  # Delete one more
+        {:ok, dbf2}
+      end)
+      
+      assert {:ok, final_dbf} = result
+      
+      # Should have deleted 4 records total
+      assert {:ok, 2} = Parser.count_active_records(final_dbf)
+      assert {:ok, 4} = Parser.count_deleted_records(final_dbf)
+      
+      Parser.close_dbf(final_dbf)
+    end
+  end
 end

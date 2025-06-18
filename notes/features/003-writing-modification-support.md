@@ -17,10 +17,10 @@ Add the ability to create new DBF files and modify existing ones, including writ
 - [x] Implement mark_deleted(dbf, index) function
 - [x] Add undelete_record(dbf, index) function
 - [x] Create pack/compact function to remove deleted records
-- [ ] Implement deleted record counting
-- [ ] Add batch deletion support
-- [ ] Implement simple transaction wrapper
-- [ ] Add rollback capability using file backup
+- [x] Implement deleted record counting
+- [x] Add batch deletion support
+- [x] Implement simple transaction wrapper
+- [x] Add rollback capability using file backup
 - [ ] Create batch write operations
 - [ ] Ensure header consistency after writes
 - [ ] Add write conflict detection
@@ -67,8 +67,8 @@ Add the ability to create new DBF files and modify existing ones, including writ
 - [x] Add update_record/3 function
 - [x] Implement record deletion functions
 - [x] Add header update utilities
-- [ ] Create transaction wrapper module
-- [ ] Implement file backup and rollback
+- [x] Create transaction wrapper module
+- [x] Implement file backup and rollback
 - [x] Add comprehensive tests for all write operations
 - [x] Test with various data types and edge cases
 - [x] Verify header consistency after operations
@@ -137,3 +137,36 @@ Add the ability to create new DBF files and modify existing ones, including writ
 - Supports in-place packing or creating new file at different location
 - Physically reclaims disk space by removing deleted record storage
 - All 7 new tests passing (109 total tests)
+
+**Transaction Wrapper Complete**: Implemented transaction system with backup/rollback capability:
+- Creates backup file before executing transaction operations
+- Supports atomic operations with automatic rollback on failure
+- Handles file descriptor lifecycle properly by closing/reopening files with write access
+- Executes transaction function with isolated file access
+- Rolls back changes on exceptions or explicit failures
+- Cleans up backup files on successful commits
+- Supports complex multi-operation transactions
+- Fixed file descriptor conflicts by using separate read-write file handles
+- All 10 transaction tests passing (117 total tests)
+
+**Record Counting Functions Complete**: Implemented comprehensive record counting and statistics:
+- count_active_records/1: Counts non-deleted records in the DBF file
+- count_deleted_records/1: Counts deleted records marked with deletion flag
+- record_statistics/1: Provides comprehensive statistics including deletion percentage
+- Efficient recursive counting without loading all records into memory
+- Handles edge cases: empty files, all-deleted files, all-active files
+- Statistics are consistent with existing pack and deletion operations
+- Real-time counting reflects current file state after modifications
+- All 6 counting tests passing (123 total tests)
+
+**Batch Deletion Support Complete**: Implemented efficient multi-record deletion operations:
+- batch_delete/2: Deletes multiple records by index list with duplicate handling
+- batch_delete_range/3: Deletes records in continuous index range (inclusive)
+- batch_delete_where/2: Deletes records matching condition function criteria
+- Efficient batch file operations to minimize I/O overhead
+- Comprehensive validation: index bounds checking, range validation
+- Idempotent operations: handles duplicates and already-deleted records gracefully
+- Single header timestamp update for entire batch operation
+- Full transaction support for atomic batch operations
+- Edge case handling: empty lists, invalid ranges, out-of-bounds indices
+- All 8 batch deletion tests passing (131 total tests)

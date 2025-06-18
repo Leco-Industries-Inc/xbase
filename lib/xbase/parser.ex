@@ -85,13 +85,30 @@ defmodule Xbase.Parser do
       {:ok, %{header: %Header{...}, fields: [...], file: #Port<...>}}
   """
   def open_dbf(path) do
-    case :file.open(path, [:read, :binary, :random]) do
+    open_dbf(path, [:read])
+  end
+
+  @doc """
+  Opens a DBF file and parses its header and field descriptors with specified file modes.
+  
+  ## Parameters
+  - `path` - Path to the DBF file
+  - `modes` - List of file open modes (e.g., [:read], [:read, :write])
+  
+  ## Returns
+  - `{:ok, %{header: header, fields: fields, file: file}}` - Successfully opened DBF
+  - `{:error, reason}` - Error opening or parsing file
+  """
+  def open_dbf(path, modes) do
+    file_modes = modes ++ [:binary, :random]
+    
+    case :file.open(path, file_modes) do
       {:ok, file} ->
         case read_and_parse_header(file) do
           {:ok, header} ->
             case read_and_parse_fields(file, header) do
               {:ok, fields} ->
-                {:ok, %{header: header, fields: fields, file: file}}
+                {:ok, %{header: header, fields: fields, file: file, file_path: path}}
               {:error, reason} ->
                 :file.close(file)
                 {:error, reason}
@@ -279,7 +296,7 @@ defmodule Xbase.Parser do
           {:ok, file} ->
             # Create DBF structure similar to open_dbf
             header = build_header(fields, opts)
-            {:ok, %{header: header, fields: fields, file: file}}
+            {:ok, %{header: header, fields: fields, file: file, file_path: path}}
           {:error, reason} ->
             {:error, reason}
         end
@@ -486,6 +503,247 @@ defmodule Xbase.Parser do
         end
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @doc """
+  Counts the number of active (non-deleted) records in the DBF file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  
+  ## Returns
+  - `{:ok, count}` - Number of active records
+  - `{:error, reason}` - Error reading records
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> Xbase.Parser.count_active_records(dbf)
+      {:ok, 150}
+  """
+  def count_active_records(%{header: header} = dbf) do
+    count_records_by_status(dbf, header.record_count, false)
+  end
+
+  @doc """
+  Counts the number of deleted records in the DBF file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  
+  ## Returns
+  - `{:ok, count}` - Number of deleted records
+  - `{:error, reason}` - Error reading records
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> Xbase.Parser.count_deleted_records(dbf)
+      {:ok, 25}
+  """
+  def count_deleted_records(%{header: header} = dbf) do
+    count_records_by_status(dbf, header.record_count, true)
+  end
+
+  @doc """
+  Provides comprehensive statistics about records in the DBF file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  
+  ## Returns
+  - `{:ok, %{total_records: int, active_records: int, deleted_records: int, deletion_percentage: float}}` - Statistics
+  - `{:error, reason}` - Error reading records
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> Xbase.Parser.record_statistics(dbf)
+      {:ok, %{total_records: 100, active_records: 85, deleted_records: 15, deletion_percentage: 15.0}}
+  """
+  def record_statistics(%{header: header} = dbf) do
+    total_records = header.record_count
+    
+    if total_records == 0 do
+      {:ok, %{
+        total_records: 0,
+        active_records: 0,
+        deleted_records: 0,
+        deletion_percentage: 0.0
+      }}
+    else
+      case count_active_records(dbf) do
+        {:ok, active_count} ->
+          deleted_count = total_records - active_count
+          deletion_percentage = (deleted_count / total_records) * 100.0
+          
+          {:ok, %{
+            total_records: total_records,
+            active_records: active_count,
+            deleted_records: deleted_count,
+            deletion_percentage: deletion_percentage
+          }}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Deletes multiple records by their indices in a single operation.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `indices` - List of record indices to delete
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully deleted records
+  - `{:error, reason}` - Error during deletion
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> Xbase.Parser.batch_delete(dbf, [1, 5, 10])
+      {:ok, updated_dbf}
+  """
+  def batch_delete(dbf, indices) when is_list(indices) do
+    # Validate all indices first
+    case validate_indices(dbf, indices) do
+      :ok ->
+        # Remove duplicates and sort for efficient processing
+        unique_indices = indices |> Enum.uniq() |> Enum.sort()
+        batch_delete_by_indices(dbf, unique_indices)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Deletes records in a specified index range (inclusive).
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `start_index` - Starting index (inclusive)
+  - `end_index` - Ending index (inclusive)
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully deleted records in range
+  - `{:error, reason}` - Error during deletion
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> Xbase.Parser.batch_delete_range(dbf, 10, 20)
+      {:ok, updated_dbf}
+  """
+  def batch_delete_range(%{header: header} = dbf, start_index, end_index) 
+      when is_integer(start_index) and is_integer(end_index) do
+    cond do
+      start_index > end_index ->
+        {:error, :invalid_range}
+      start_index < 0 or end_index >= header.record_count ->
+        {:error, :invalid_record_index}
+      true ->
+        indices = Enum.to_list(start_index..end_index)
+        batch_delete_by_indices(dbf, indices)
+    end
+  end
+
+  @doc """
+  Deletes records that match a given condition function.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `condition_fn` - Function that takes record data and returns true to delete
+  
+  ## Returns
+  - `{:ok, updated_dbf}` - Successfully deleted matching records
+  - `{:error, reason}` - Error during deletion
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf", [:read, :write])
+      iex> condition = fn record -> record["STATUS"] == "inactive" end
+      iex> Xbase.Parser.batch_delete_where(dbf, condition)
+      {:ok, updated_dbf}
+  """
+  def batch_delete_where(%{header: header} = dbf, condition_fn) when is_function(condition_fn, 1) do
+    case find_matching_indices(dbf, header.record_count, condition_fn) do
+      {:ok, matching_indices} ->
+        batch_delete_by_indices(dbf, matching_indices)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Executes a transaction function with rollback capability.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `transaction_fn` - Function that takes a DBF and returns {:ok, updated_dbf} or {:error, reason}
+  
+  ## Returns
+  - `{:ok, final_dbf}` - Successfully committed transaction
+  - `{:error, reason}` - Transaction failed and was rolled back
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> {:ok, final_dbf} = Xbase.Parser.transaction(dbf, fn dbf ->
+      ...>   {:ok, dbf1} = Xbase.Parser.append_record(dbf, %{"NAME" => "John"})
+      ...>   {:ok, dbf2} = Xbase.Parser.update_record(dbf1, 0, %{"STATUS" => "active"})
+      ...>   {:ok, dbf2}
+      ...> end)
+  """
+  def transaction(dbf, transaction_fn) when is_function(transaction_fn, 1) do
+    # Get the file path from the DBF structure
+    file_path = get_file_path(dbf)
+    backup_path = file_path <> ".backup"
+    
+    # Close the current file to avoid descriptor conflicts
+    close_dbf(dbf)
+    
+    # Create backup of the original file
+    case create_backup(file_path, backup_path) do
+      :ok ->
+        # Reopen the file for the transaction with read-write access
+        case open_dbf(file_path, [:read, :write]) do
+          {:ok, reopened_dbf} ->
+            try do
+              # Execute the transaction function with the reopened DBF
+              result = transaction_fn.(reopened_dbf)
+              
+              case result do
+                {:ok, updated_dbf} ->
+                  # Transaction succeeded - close file and clean up backup
+                  close_dbf(updated_dbf)
+                  cleanup_backup(backup_path)
+                  # Return the final state by reopening the file
+                  open_dbf(file_path, [:read, :write])
+                
+                {:error, reason} ->
+                  # Transaction failed - close file and restore from backup
+                  close_dbf(reopened_dbf)
+                  restore_from_backup(file_path, backup_path)
+                  {:error, reason}
+                
+                _invalid_return ->
+                  # Invalid return value - close file and restore from backup
+                  close_dbf(reopened_dbf)
+                  restore_from_backup(file_path, backup_path)
+                  {:error, :invalid_transaction_return}
+              end
+            rescue
+              exception ->
+                # Exception occurred - close file and restore from backup
+                close_dbf(reopened_dbf)
+                restore_from_backup(file_path, backup_path)
+                {:error, exception}
+            end
+          
+          {:error, reason} ->
+            # Failed to reopen file - restore from backup
+            restore_from_backup(file_path, backup_path)
+            {:error, {:reopen_failed, reason}}
+        end
+      
+      {:error, reason} ->
+        {:error, {:backup_failed, reason}}
     end
   end
 
@@ -891,7 +1149,7 @@ defmodule Xbase.Parser do
           {:ok, file} ->
             case :file.write(file, complete_binary) do
               :ok ->
-                {:ok, %{header: packed_header, fields: fields, file: file}}
+                {:ok, %{header: packed_header, fields: fields, file: file, file_path: output_path}}
               {:error, reason} ->
                 :file.close(file)
                 {:error, reason}
@@ -939,4 +1197,130 @@ defmodule Xbase.Parser do
         {:error, reason}
     end
   end
+
+  defp validate_indices(%{header: header}, indices) do
+    invalid_indices = Enum.filter(indices, fn index ->
+      index < 0 or index >= header.record_count
+    end)
+    
+    if Enum.empty?(invalid_indices) do
+      :ok
+    else
+      {:error, :invalid_record_index}
+    end
+  end
+
+  defp batch_delete_by_indices(dbf, []) do
+    {:ok, dbf}
+  end
+
+  defp batch_delete_by_indices(%{header: header, file: file} = dbf, indices) do
+    # Process deletions efficiently by batching file writes
+    case batch_write_deletion_flags(file, header, indices) do
+      :ok ->
+        # Update header timestamp once for the entire batch
+        updated_header = update_header_timestamp(header)
+        case write_header(file, updated_header) do
+          :ok ->
+            {:ok, %{dbf | header: updated_header}}
+          {:error, reason} ->
+            {:error, reason}
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp batch_write_deletion_flags(file, header, indices) do
+    deletion_flag = <<0x2A>>  # Deleted record flag
+    
+    # Create list of {offset, data} tuples for batch writing
+    write_operations = Enum.map(indices, fn index ->
+      offset = calculate_record_offset(header, index)
+      {offset, deletion_flag}
+    end)
+    
+    # Execute all writes
+    batch_write_operations(file, write_operations)
+  end
+
+  defp batch_write_operations(_file, []) do
+    :ok
+  end
+
+  defp batch_write_operations(file, [{offset, data} | rest]) do
+    case :file.pwrite(file, offset, data) do
+      :ok ->
+        batch_write_operations(file, rest)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_matching_indices(dbf, total_records, condition_fn) do
+    find_matching_indices_recursive(dbf, 0, total_records, condition_fn, [])
+  end
+
+  defp find_matching_indices_recursive(_dbf, index, max, _condition_fn, acc) when index >= max do
+    {:ok, Enum.reverse(acc)}
+  end
+
+  defp find_matching_indices_recursive(dbf, index, max, condition_fn, acc) do
+    case read_record(dbf, index) do
+      {:ok, record} ->
+        # Only check condition for non-deleted records
+        if not record.deleted and condition_fn.(record.data) do
+          find_matching_indices_recursive(dbf, index + 1, max, condition_fn, [index | acc])
+        else
+          find_matching_indices_recursive(dbf, index + 1, max, condition_fn, acc)
+        end
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp count_records_by_status(dbf, total_records, target_deleted_status) do
+    count_records_by_status_recursive(dbf, 0, total_records, target_deleted_status, 0)
+  end
+
+  defp count_records_by_status_recursive(_dbf, index, max, _target_deleted_status, acc) when index >= max do
+    {:ok, acc}
+  end
+
+  defp count_records_by_status_recursive(dbf, index, max, target_deleted_status, acc) do
+    case read_record(dbf, index) do
+      {:ok, record} ->
+        new_acc = if record.deleted == target_deleted_status, do: acc + 1, else: acc
+        count_records_by_status_recursive(dbf, index + 1, max, target_deleted_status, new_acc)
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp get_file_path(%{file_path: path}) do
+    path
+  end
+
+  defp create_backup(source_path, backup_path) do
+    case File.cp(source_path, backup_path) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cleanup_backup(backup_path) do
+    File.rm(backup_path)
+    :ok
+  end
+
+  defp restore_from_backup(original_path, backup_path) do
+    case File.cp(backup_path, original_path) do
+      :ok -> 
+        File.rm(backup_path)
+        :ok
+      {:error, reason} -> 
+        {:error, reason}
+    end
+  end
+
 end
