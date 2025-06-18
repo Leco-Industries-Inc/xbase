@@ -1833,4 +1833,200 @@ defmodule Xbase.Parser do
     end
   end
 
+  @doc """
+  Creates a lazy stream of records from the DBF file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  
+  ## Returns
+  - `Stream.t()` - Stream of record data maps (excludes deleted records)
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> stream = Xbase.Parser.stream_records(dbf)
+      iex> stream |> Enum.take(10) |> length()
+      10
+  """
+  def stream_records(%{header: header} = dbf) do
+    Stream.resource(
+      fn -> 0 end,
+      fn index ->
+        if index >= header.record_count do
+          {:halt, index}
+        else
+          case read_record(dbf, index) do
+            {:ok, record} ->
+              if record.deleted do
+                # Skip deleted records, continue with next index
+                {[], index + 1}
+              else
+                # Return record data and next index
+                {[record.data], index + 1}
+              end
+            {:error, _reason} ->
+              # Stop on error
+              {:halt, index}
+          end
+        end
+      end,
+      fn _index -> :ok end
+    )
+  end
+
+  @doc """
+  Creates a filtered stream of records from the DBF file.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `filter_fn` - Function that takes record data and returns true/false
+  
+  ## Returns
+  - `Stream.t()` - Stream of filtered record data maps
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> high_scores = fn record -> record["SCORE"] > 90 end
+      iex> stream = Xbase.Parser.stream_where(dbf, high_scores)
+      iex> Enum.to_list(stream)
+      [%{"SCORE" => 95, ...}, ...]
+  """
+  def stream_where(dbf, filter_fn) when is_function(filter_fn, 1) do
+    dbf
+    |> stream_records()
+    |> Stream.filter(filter_fn)
+  end
+
+  @doc """
+  Reads records in chunks of specified size.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `chunk_size` - Number of records per chunk
+  
+  ## Returns
+  - `Stream.t()` - Stream of record lists (chunks)
+  
+  ## Examples
+      iex> {:ok, dbf} = Xbase.Parser.open_dbf("data.dbf")
+      iex> chunks = Xbase.Parser.read_in_chunks(dbf, 100)
+      iex> Enum.each(chunks, fn chunk -> process_chunk(chunk) end)
+      :ok
+  """
+  def read_in_chunks(dbf, chunk_size) when is_integer(chunk_size) and chunk_size > 0 do
+    dbf
+    |> stream_records()
+    |> Stream.chunk_every(chunk_size)
+  end
+
+  @doc """
+  Reads records in chunks with progress reporting.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `chunk_size` - Number of records per chunk
+  - `progress_fn` - Function called with progress info: `fn %{current: int, total: int, percentage: float} -> any end`
+  
+  ## Returns
+  - `Stream.t()` - Stream of record lists (chunks) with progress reporting
+  
+  ## Examples
+      progress_fn = fn prog -> IO.puts("Progress: " <> to_string(prog.percentage) <> "%") end
+      chunks = Xbase.Parser.read_in_chunks_with_progress(dbf, 100, progress_fn)
+      Enum.each(chunks, fn chunk -> process_chunk(chunk) end)
+  """
+  def read_in_chunks_with_progress(%{header: header} = dbf, chunk_size, progress_fn) 
+      when is_integer(chunk_size) and chunk_size > 0 and is_function(progress_fn, 1) do
+    
+    total_records = header.record_count
+    
+    dbf
+    |> stream_records()
+    |> Stream.chunk_every(chunk_size)
+    |> Stream.with_index()
+    |> Stream.map(fn {chunk, chunk_index} ->
+      # Calculate progress
+      records_processed = (chunk_index + 1) * chunk_size
+      # Don't exceed total for last chunk
+      actual_processed = min(records_processed, total_records)
+      
+      progress = %{
+        current: actual_processed,
+        total: total_records,
+        percentage: Float.round(actual_processed / total_records * 100, 1)
+      }
+      
+      # Report progress
+      progress_fn.(progress)
+      
+      # Return the chunk
+      chunk
+    end)
+  end
+
+  @doc """
+  Creates a stream with progress reporting.
+  
+  ## Parameters
+  - `dbf` - DBF file structure from open_dbf/1
+  - `progress_fn` - Function called with progress info
+  
+  ## Returns
+  - `Stream.t()` - Stream of records with progress reporting
+  
+  ## Examples
+      progress_fn = fn prog -> send(self(), {:progress, prog}) end
+      records = Xbase.Parser.stream_records_with_progress(dbf, progress_fn) |> Enum.to_list()
+  """
+  def stream_records_with_progress(%{header: header} = dbf, progress_fn) 
+      when is_function(progress_fn, 1) do
+    
+    total_records = header.record_count
+    
+    dbf
+    |> stream_records()
+    |> Stream.with_index()
+    |> Stream.map(fn {record, index} ->
+      # Calculate progress (index is 0-based)
+      records_processed = index + 1
+      
+      progress = %{
+        current: records_processed,
+        total: total_records,
+        percentage: Float.round(records_processed / total_records * 100, 1)
+      }
+      
+      # Report progress occasionally (every 10% or on last record)
+      if rem(records_processed, max(1, div(total_records, 10))) == 0 or records_processed == total_records do
+        progress_fn.(progress)
+      end
+      
+      # Return the record
+      record
+    end)
+  end
+
+  @doc """
+  Returns current memory usage statistics.
+  
+  ## Returns
+  - `%{total: integer, processes: integer, system: integer}` - Memory usage in bytes
+  
+  ## Examples
+      memory = Xbase.Parser.memory_usage()
+      # => %{total: 52428800, processes: 12345, system: 9876, ...}
+  """
+  def memory_usage do
+    memory_info = :erlang.memory()
+    
+    %{
+      total: Keyword.get(memory_info, :total, 0),
+      processes: Keyword.get(memory_info, :processes, 0),
+      system: Keyword.get(memory_info, :system, 0),
+      atom: Keyword.get(memory_info, :atom, 0),
+      binary: Keyword.get(memory_info, :binary, 0),
+      ets: Keyword.get(memory_info, :ets, 0)
+    }
+  end
+
 end

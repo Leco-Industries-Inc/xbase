@@ -2522,4 +2522,286 @@ defmodule Xbase.ParserTest do
       Parser.close_dbf(packed_dbf)
     end
   end
+
+  describe "streaming operations" do
+    setup do
+      temp_path = "/tmp/test_streaming_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "NAME", type: "C", length: 20, decimal_count: 0},
+        %FieldDescriptor{name: "SCORE", type: "N", length: 6, decimal_count: 2},
+        %FieldDescriptor{name: "ACTIVE", type: "L", length: 1, decimal_count: 0}
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add test records for streaming
+      records = [
+        %{"ID" => 1, "NAME" => "Alice", "SCORE" => 85.50, "ACTIVE" => true},
+        %{"ID" => 2, "NAME" => "Bob", "SCORE" => 92.25, "ACTIVE" => true},
+        %{"ID" => 3, "NAME" => "Charlie", "SCORE" => 78.75, "ACTIVE" => false},
+        %{"ID" => 4, "NAME" => "Diana", "SCORE" => 88.00, "ACTIVE" => true},
+        %{"ID" => 5, "NAME" => "Eve", "SCORE" => 95.50, "ACTIVE" => false}
+      ]
+      
+      {:ok, populated_dbf} = Parser.batch_append_records(dbf, records)
+      Parser.close_dbf(populated_dbf)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "stream_records returns a lazy stream of all records", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Should return a Stream
+      stream = Parser.stream_records(dbf)
+      assert is_function(stream)
+      
+      # Should lazily produce all records
+      records = Enum.to_list(stream)
+      assert length(records) == 5
+      
+      # Verify first record content
+      first_record = List.first(records)
+      assert first_record["NAME"] == "Alice"
+      assert first_record["ID"] == 1
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "stream_records excludes deleted records by default", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path, [:read, :write])
+      
+      # Mark middle record as deleted
+      {:ok, dbf_with_deletion} = Parser.mark_deleted(dbf, 2)
+      
+      # Stream should exclude deleted record
+      stream = Parser.stream_records(dbf_with_deletion)
+      records = Enum.to_list(stream)
+      
+      assert length(records) == 4  # One record deleted
+      
+      # Verify Charlie (index 2) is not in results
+      names = Enum.map(records, & &1["NAME"])
+      refute "Charlie" in names
+      
+      Parser.close_dbf(dbf_with_deletion)
+    end
+
+    test "stream_where filters records based on predicate", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Filter for high scores only
+      high_score_filter = fn record -> record["SCORE"] > 90.0 end
+      
+      stream = Parser.stream_where(dbf, high_score_filter)
+      records = Enum.to_list(stream)
+      
+      assert length(records) == 2  # Bob (92.25) and Eve (95.50)
+      
+      scores = Enum.map(records, & &1["SCORE"])
+      assert Enum.all?(scores, fn score -> score > 90.0 end)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "stream_where with active status filter", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Filter for active users only
+      active_filter = fn record -> record["ACTIVE"] == true end
+      
+      stream = Parser.stream_where(dbf, active_filter)
+      records = Enum.to_list(stream)
+      
+      assert length(records) == 3  # Alice, Bob, Diana
+      
+      # All should be active
+      assert Enum.all?(records, fn record -> record["ACTIVE"] == true end)
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "read_in_chunks processes records in specified chunk sizes", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      chunk_size = 2
+      chunks = Parser.read_in_chunks(dbf, chunk_size) |> Enum.to_list()
+      
+      # Should have 3 chunks: [2, 2, 1] records
+      assert length(chunks) == 3
+      assert length(Enum.at(chunks, 0)) == 2
+      assert length(Enum.at(chunks, 1)) == 2  
+      assert length(Enum.at(chunks, 2)) == 1
+      
+      # Verify all records are included
+      all_records = List.flatten(chunks)
+      assert length(all_records) == 5
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "stream is memory efficient - doesn't load all records at once", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # This test verifies lazy evaluation
+      stream = Parser.stream_records(dbf)
+      
+      # Taking only first element should not process all records
+      first_record = stream |> Enum.take(1) |> List.first()
+      
+      assert first_record["NAME"] == "Alice"
+      
+      # Stream should still be valid for more operations
+      second_batch = stream |> Enum.drop(1) |> Enum.take(2)
+      assert length(second_batch) == 2
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "read_in_chunks_with_progress reports progress during processing", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      # Collect progress reports
+      _progress_reports = []
+      progress_fn = fn progress ->
+        send(self(), {:progress, progress})
+      end
+      
+      chunk_size = 2
+      chunks = Parser.read_in_chunks_with_progress(dbf, chunk_size, progress_fn) |> Enum.to_list()
+      
+      # Should have 3 chunks processed
+      assert length(chunks) == 3
+      
+      # Should receive progress notifications
+      progress_messages = receive_all_progress_messages([])
+      assert length(progress_messages) >= 3  # At least one per chunk
+      
+      # Progress should include current/total information
+      final_progress = List.last(progress_messages)
+      assert final_progress.current >= 5  # All records processed
+      assert final_progress.total == 5
+      assert final_progress.percentage == 100.0
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "stream_records_with_progress reports progress during streaming", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      progress_fn = fn progress ->
+        send(self(), {:progress, progress})
+      end
+      
+      # Process all records through stream
+      records = Parser.stream_records_with_progress(dbf, progress_fn) |> Enum.to_list()
+      
+      assert length(records) == 5
+      
+      # Should receive progress updates
+      progress_messages = receive_all_progress_messages([])
+      assert length(progress_messages) >= 1
+      
+      # Final progress should be 100%
+      final_progress = List.last(progress_messages)
+      assert final_progress.percentage == 100.0
+      
+      Parser.close_dbf(dbf)
+    end
+
+    defp receive_all_progress_messages(acc) do
+      receive do
+        {:progress, progress} -> receive_all_progress_messages([progress | acc])
+      after
+        100 -> Enum.reverse(acc)
+      end
+    end
+  end
+
+  describe "memory monitoring" do
+    setup do
+      temp_path = "/tmp/test_memory_#{:rand.uniform(10000)}.dbf"
+      
+      fields = [
+        %FieldDescriptor{name: "ID", type: "N", length: 5, decimal_count: 0},
+        %FieldDescriptor{name: "DATA", type: "C", length: 100, decimal_count: 0}  # Larger field for memory testing
+      ]
+      
+      {:ok, dbf} = Parser.create_dbf(temp_path, fields)
+      
+      # Add several records for memory testing
+      large_data = String.duplicate("X", 90)  # Large string data
+      records = for i <- 1..20 do
+        %{"ID" => i, "DATA" => large_data <> "_#{i}"}
+      end
+      
+      {:ok, populated_dbf} = Parser.batch_append_records(dbf, records)
+      Parser.close_dbf(populated_dbf)
+      
+      on_exit(fn ->
+        File.rm(temp_path)
+      end)
+      
+      {:ok, path: temp_path}
+    end
+
+    test "memory_usage returns current memory statistics", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      initial_memory = Parser.memory_usage()
+      assert is_map(initial_memory)
+      assert Map.has_key?(initial_memory, :total)
+      assert Map.has_key?(initial_memory, :processes)
+      assert Map.has_key?(initial_memory, :system)
+      
+      # Process some records and check memory didn't spike significantly
+      stream = Parser.stream_records(dbf)
+      _records = stream |> Enum.take(10)
+      
+      after_memory = Parser.memory_usage()
+      
+      # Memory usage should be reasonable (not a huge spike)
+      memory_increase = after_memory.total - initial_memory.total
+      assert memory_increase < 10_000_000  # Less than 10MB increase
+      
+      Parser.close_dbf(dbf)
+    end
+
+    test "stream processing maintains constant memory usage", %{path: path} do
+      {:ok, dbf} = Parser.open_dbf(path)
+      
+      initial_memory = Parser.memory_usage()
+      
+      # Process records in chunks to verify memory stays constant
+      chunk_memories = 
+        dbf
+        |> Parser.read_in_chunks(5)
+        |> Enum.map(fn _chunk ->
+          current_memory = Parser.memory_usage()
+          current_memory.total
+        end)
+        |> Enum.to_list()
+      
+      final_memory = Parser.memory_usage()
+      
+      # Memory should not grow significantly during streaming
+      max_memory = Enum.max(chunk_memories)
+      memory_growth = max_memory - initial_memory.total
+      
+      # Should not use more than 10MB during processing
+      assert memory_growth < 10_000_000
+      
+      # Final memory should be close to initial (within 3MB)
+      final_growth = final_memory.total - initial_memory.total
+      assert final_growth < 3_000_000
+      
+      Parser.close_dbf(dbf)
+    end
+  end
 end
