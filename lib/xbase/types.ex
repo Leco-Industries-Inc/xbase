@@ -87,4 +87,46 @@ defmodule Xbase.Types do
       raw_data: binary()
     }
   end
+
+  defmodule DbtHeader do
+    @moduledoc """
+    DBT (memo) file header structure containing metadata about memo storage.
+    
+    The header is a 512-byte structure at the beginning of every DBT file,
+    containing information about block allocation and format version.
+    """
+    
+    defstruct [
+      :next_block,    # Next available block number for allocation
+      :block_size,    # Size of each memo block in bytes (typically 512)
+      :version        # DBT format version (:dbase_iii or :dbase_iv)
+    ]
+
+    @type t :: %__MODULE__{
+      next_block: non_neg_integer(),
+      block_size: pos_integer(),
+      version: :dbase_iii | :dbase_iv
+    }
+  end
+
+  defmodule DbtFile do
+    @moduledoc """
+    DBT file structure containing header information and file handle.
+    
+    Represents an opened DBT memo file with parsed header and file descriptor
+    for reading memo content blocks.
+    """
+    
+    defstruct [
+      :header,    # DbtHeader structure
+      :file,      # File handle from :file.open
+      :file_path  # Path to the DBT file
+    ]
+
+    @type t :: %__MODULE__{
+      header: DbtHeader.t(),
+      file: :file.io_device(),
+      file_path: String.t()
+    }
+  end
 end
