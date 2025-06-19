@@ -53,7 +53,7 @@ IO.inspect(record.data)
 # => %{"NAME" => "John Doe", "AGE" => 30, "CITY" => "New York"}
 
 # Read all records
-records = Xbase.Parser.read_all_records(dbf)
+{:ok, records} = Xbase.Parser.read_records(dbf)
 IO.puts("Total records: #{length(records)}")
 
 # Don't forget to close the file
@@ -169,7 +169,7 @@ Always handle errors appropriately:
 case Xbase.Parser.open_dbf("data.dbf") do
   {:ok, dbf} ->
     # Work with the file
-    records = Xbase.Parser.read_all_records(dbf)
+    {:ok, records} = Xbase.Parser.read_records(dbf)
     Xbase.Parser.close_dbf(dbf)
     {:ok, records}
     
