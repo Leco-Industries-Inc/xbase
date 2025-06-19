@@ -21,3 +21,22 @@ xbase-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+# DBF-related files (if you want to ignore test data files)
+*.dbf
+*.dbt
+*.cdx
+*.mdx
+*.fpt
+
+# Common file types you might want to ignore
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
