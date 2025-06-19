@@ -19,7 +19,10 @@ defmodule Xbase.MixProject do
         extras: [
           "README.md",
           "docs/guides/getting_started.md",
-          "docs/guides/memo_fields.md"
+          "docs/guides/memo_fields.md",
+          "docs/guides/indexes.md",
+          "docs/guides/streaming.md",
+          "docs/guides/performance.md"
         ],
         groups_for_extras: [
           "Guides": ~r/docs\/guides\/.*/
