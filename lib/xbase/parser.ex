@@ -1291,7 +1291,7 @@ defmodule Xbase.Parser do
       "N" -> 0           # Numeric - zero
       "L" -> false       # Logical - false
       "D" -> nil         # Date - nil (will be encoded as spaces)
-      "M" -> 0           # Memo - zero block reference
+      "M" -> {:memo_ref, 0}  # Memo - zero block reference as tuple
       _ -> ""            # Default to empty string
     end
   end
