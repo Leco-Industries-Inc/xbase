@@ -27,7 +27,7 @@ defmodule Xbase.DbtParser do
 
   def parse_header(header_binary, :dbase_iii) do
     case header_binary do
-      <<next_block::little-32, _unknown::16, block_size::little-16, _padding::504*8>> ->
+      <<next_block::little-32, _unknown::little-32, _unknown2::16, block_size::little-16, _padding::500*8>> ->
         if block_size >= 512 and block_size <= 65536 do
           {:ok, %DbtHeader{
             next_block: next_block,
@@ -70,6 +70,8 @@ defmodule Xbase.DbtParser do
   - Integer byte offset from start of file
   """
   def calculate_block_offset(%DbtHeader{block_size: block_size}, block_number) do
+    # Block 0 is the header (512 bytes), so block 1 starts at offset 512
+    # Block N starts at offset (N * block_size)
     block_number * block_size
   end
 
@@ -161,6 +163,8 @@ defmodule Xbase.DbtParser do
         case :file.pread(file, offset, header.block_size) do
           {:ok, block_data} ->
             extract_memo_content(block_data)
+          :eof ->
+            {:error, :block_beyond_file_end}
           {:error, reason} ->
             {:error, reason}
         end
