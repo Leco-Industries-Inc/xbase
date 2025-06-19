@@ -444,7 +444,7 @@ defmodule Xbase.MemoHandler do
     process_memo_update_fields_recursive(handler, existing_record, update_data, updated_memo_fields, %{})
   end
 
-  defp process_memo_update_fields_recursive(handler, existing_record, update_data, [], processed_data) do
+  defp process_memo_update_fields_recursive(handler, _existing_record, update_data, [], processed_data) do
     # All updated memo fields processed
     final_data = Map.merge(update_data, processed_data)
     {:ok, {final_data, handler}}

@@ -7,7 +7,7 @@ defmodule Xbase.CdxParser do
   about the index structure and key expressions.
   """
 
-  alias Xbase.Types.{CdxHeader, CdxNode, CdxFile, IndexKey}
+  alias Xbase.Types.{CdxHeader, CdxNode, CdxFile}
 
   @page_size 512
 

@@ -244,7 +244,7 @@ defmodule Xbase.DbtWriter do
   - `{:ok, compacted_dbt_file}` - Successfully compacted DBT file
   - `{:error, reason}` - Error during compaction
   """
-  def compact_dbt(%DbtFile{header: header, file: file, file_path: input_path} = _dbt_file, output_path) do
+  def compact_dbt(%DbtFile{header: header, file: file, file_path: _input_path} = _dbt_file, output_path) do
     temp_path = output_path <> ".tmp"
     
     case create_dbt(temp_path, version: header.version, block_size: header.block_size) do

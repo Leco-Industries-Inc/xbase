@@ -64,7 +64,7 @@ mix deps.get
 # => %Xbase.Types.Record{data: %{"NAME" => "John Doe", "AGE" => 30}, deleted: false}
 
 # Read all records
-records = Xbase.Parser.read_all_records(dbf)
+{:ok, records} = Xbase.Parser.read_records(dbf)
 
 # Stream records for memory efficiency
 dbf
@@ -270,7 +270,7 @@ mix credo                  # Code quality
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## 🙏 Acknowledgments
 
