@@ -36,6 +36,7 @@ defmodule Xbase.FieldParser do
     
     case trimmed do
       "" -> {:ok, nil}  # Empty field
+      "*" <> _ -> {:ok, nil}  # Overflow/invalid value represented as asterisks
       _ ->
         case Integer.parse(trimmed) do
           {value, ""} -> {:ok, value}
@@ -51,6 +52,7 @@ defmodule Xbase.FieldParser do
     
     case trimmed do
       "" -> {:ok, nil}  # Empty field
+      "*" <> _ -> {:ok, nil}  # Overflow/invalid value represented as asterisks
       _ ->
         case Float.parse(trimmed) do
           {value, ""} -> {:ok, value}
@@ -106,44 +108,70 @@ defmodule Xbase.FieldParser do
   end
 
   def parse(%FieldDescriptor{type: "I"} = _field_desc, binary_data) do
-    # Integer field: 4-byte signed little-endian integer
-    case byte_size(binary_data) do
-      4 ->
-        <<value::little-signed-32>> = binary_data
-        {:ok, value}
+    # Integer field: In dBase III format, often stored as text string (right-aligned)
+    # Try text parsing first, then binary if that fails
+    trimmed = String.trim(binary_data)
+    
+    case trimmed do
+      "" -> {:ok, nil}  # Empty field
       _ ->
-        {:error, :invalid_integer_size}
+        case Integer.parse(trimmed) do
+          {value, ""} -> {:ok, value}
+          _ -> 
+            # If text parsing fails, try binary format (4-byte little-endian)
+            case byte_size(binary_data) do
+              4 ->
+                <<value::little-signed-32>> = binary_data
+                {:ok, value}
+              _ ->
+                {:error, :invalid_integer_format}
+            end
+        end
     end
   end
 
   def parse(%FieldDescriptor{type: "T"} = _field_desc, binary_data) do
-    # DateTime field: 8-byte timestamp (Julian day + milliseconds since midnight)
-    case byte_size(binary_data) do
-      8 ->
-        <<julian_day::little-32, milliseconds::little-32>> = binary_data
-        
-        # Handle empty/null datetime (often represented as all zeros)
-        case {julian_day, milliseconds} do
-          {0, 0} -> {:ok, nil}
-          _ ->
-            # Convert Julian day to date
-            case julian_to_date(julian_day) do
-              {:ok, date} ->
-                # Convert milliseconds to time
-                case milliseconds_to_time(milliseconds) do
-                  {:ok, time} ->
-                    # Combine date and time into datetime
-                    case DateTime.new(date, time, "Etc/UTC") do
-                      {:ok, datetime} -> {:ok, datetime}
-                      {:error, _} -> {:error, :invalid_datetime}
+    # DateTime field: In dBase III, often stored as text. Try multiple formats.
+    trimmed = String.trim(binary_data)
+    
+    case trimmed do
+      "" -> {:ok, nil}  # Empty field
+      _ ->
+        # Try text parsing first (common in dBase III)
+        case parse_datetime_text(trimmed) do
+          {:ok, datetime} -> {:ok, datetime}
+          {:error, :truncated_datetime} -> {:ok, nil}  # Treat truncated as null
+          {:error, :invalid_datetime_format} -> {:ok, nil}  # Treat invalid format as null
+          {:error, _} ->
+            # If text parsing fails, try binary format (8-byte Julian day + milliseconds)
+            case byte_size(binary_data) do
+              8 ->
+                <<julian_day::little-32, milliseconds::little-32>> = binary_data
+                
+                # Handle empty/null datetime (often represented as all zeros)
+                case {julian_day, milliseconds} do
+                  {0, 0} -> {:ok, nil}
+                  _ ->
+                    # Convert Julian day to date
+                    case julian_to_date(julian_day) do
+                      {:ok, date} ->
+                        # Convert milliseconds to time
+                        case milliseconds_to_time(milliseconds) do
+                          {:ok, time} ->
+                            # Combine date and time into datetime
+                            case DateTime.new(date, time, "Etc/UTC") do
+                              {:ok, datetime} -> {:ok, datetime}
+                              {:error, _} -> {:error, :invalid_datetime}
+                            end
+                          {:error, _reason} -> {:ok, nil}  # Treat invalid time as null
+                        end
+                      {:error, _reason} -> {:ok, nil}  # Treat invalid date as null
                     end
-                  {:error, reason} -> {:error, reason}
                 end
-              {:error, reason} -> {:error, reason}
+              _ ->
+                {:ok, nil}  # Treat wrong size as null instead of error
             end
         end
-      _ ->
-        {:error, :invalid_datetime_size}
     end
   end
 
@@ -192,6 +220,75 @@ defmodule Xbase.FieldParser do
       Time.new(hours, minutes, seconds, microseconds)
     else
       {:error, :invalid_time_milliseconds}
+    end
+  end
+
+  # Helper function to parse datetime from text format
+  defp parse_datetime_text(text) do
+    # Common datetime text formats in DBF files:
+    # YYYYMMDD - Date only
+    # YYYYMMDDHHMMSS - Full datetime
+    # Various timestamp formats
+    
+    # Check if the text contains only numeric characters (and spaces)
+    clean_text = String.replace(text, " ", "")
+    if String.match?(clean_text, ~r/^\d*$/) and String.length(clean_text) > 0 do
+      case String.length(clean_text) do
+        8 ->
+          # YYYYMMDD format (date only)
+          case clean_text do
+            <<year::binary-size(4), month::binary-size(2), day::binary-size(2)>> ->
+              case {Integer.parse(year), Integer.parse(month), Integer.parse(day)} do
+                {{y, ""}, {m, ""}, {d, ""}} when y > 1900 and y < 3000 and m >= 1 and m <= 12 and d >= 1 and d <= 31 ->
+                  case Date.new(y, m, d) do
+                    {:ok, date} -> 
+                      # Convert to datetime at midnight UTC
+                      case DateTime.new(date, ~T[00:00:00], "Etc/UTC") do
+                        {:ok, datetime} -> {:ok, datetime}
+                        {:error, _} -> {:error, :invalid_date}
+                      end
+                    {:error, _} -> {:error, :invalid_date}
+                  end
+                _ -> {:error, :invalid_date_format}
+              end
+            _ -> {:error, :invalid_date_format}
+          end
+        
+        14 ->
+          # YYYYMMDDHHMMSS format (full datetime)
+          case clean_text do
+            <<year::binary-size(4), month::binary-size(2), day::binary-size(2), 
+              hour::binary-size(2), minute::binary-size(2), second::binary-size(2)>> ->
+              case {Integer.parse(year), Integer.parse(month), Integer.parse(day),
+                    Integer.parse(hour), Integer.parse(minute), Integer.parse(second)} do
+                {{y, ""}, {m, ""}, {d, ""}, {h, ""}, {min, ""}, {s, ""}} when 
+                  y > 1900 and y < 3000 and m >= 1 and m <= 12 and d >= 1 and d <= 31 and
+                  h >= 0 and h <= 23 and min >= 0 and min <= 59 and s >= 0 and s <= 59 ->
+                  case NaiveDateTime.new(y, m, d, h, min, s) do
+                    {:ok, naive_datetime} -> 
+                      # Convert to UTC datetime
+                      case DateTime.from_naive(naive_datetime, "Etc/UTC") do
+                        {:ok, datetime} -> {:ok, datetime}
+                        {:error, _} -> {:error, :invalid_datetime}
+                      end
+                    {:error, _} -> {:error, :invalid_datetime}
+                  end
+                _ -> {:error, :invalid_datetime_format}
+              end
+            _ -> {:error, :invalid_datetime_format}
+          end
+        
+        n when n in [5, 6, 7] ->
+          # Partial/truncated dates - treat as invalid but don't crash
+          {:error, :truncated_datetime}
+        
+        _ ->
+          # Other numeric formats - might be timestamps or other formats
+          {:error, :unsupported_datetime_format}
+      end
+    else
+      # Non-numeric or empty content
+      {:error, :invalid_datetime_format}
     end
   end
 end
