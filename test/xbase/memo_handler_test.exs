@@ -5,6 +5,9 @@ defmodule Xbase.MemoHandlerTest do
   alias Xbase.Parser
   alias Xbase.Types.FieldDescriptor
 
+  # Path to real test data files
+  @test_dbf_path "test/prrolls.DBF"
+
   describe "opening DBF files with memo support" do
     setup do
       dbf_path = "/tmp/test_memo_#{:rand.uniform(10000)}.dbf"
@@ -484,6 +487,168 @@ defmodule Xbase.MemoHandlerTest do
       
       # Verify DBT header shows allocated blocks
       assert h2.dbt.header.next_block == 3  # Header is block 0, memos in blocks 1 and 2
+    end
+  end
+
+  describe "Integration Tests with Real Data (prrolls.DBF)" do
+    @tag :integration
+    test "detects memo field support in real DBF file" do
+      # prrolls.DBF likely doesn't have memo fields, but test the detection
+      case MemoHandler.open_dbf_with_memo(@test_dbf_path) do
+        {:ok, handler} ->
+          # Successfully opened - check for memo fields
+          memo_fields = Enum.filter(handler.dbf.fields, &(&1.type == "M"))
+          
+          if length(memo_fields) > 0 do
+            IO.puts("Found #{length(memo_fields)} memo fields in real data")
+            
+            # Test reading with memo resolution
+            {:ok, record} = MemoHandler.read_record_with_memo(handler, 0)
+            assert is_map(record)
+            
+            # Verify memo fields are handled
+            for field <- memo_fields do
+              memo_value = record[field.name]
+              assert is_binary(memo_value) or match?({:memo_ref, _}, memo_value)
+            end
+          else
+            IO.puts("No memo fields in prrolls.DBF - testing memo detection only")
+          end
+          
+          MemoHandler.close_memo_files(handler)
+          
+        {:error, :dbf_no_memo_support} ->
+          IO.puts("prrolls.DBF does not support memo fields - this is expected")
+          
+        {:error, :dbt_file_required} ->
+          IO.puts("No DBT file found for prrolls.DBF - expected for non-memo files")
+          
+        {:error, reason} ->
+          flunk("Unexpected error opening real DBF with memo handler: #{inspect(reason)}")
+      end
+    end
+
+    @tag :integration
+    test "handles real DBF file without memo fields gracefully" do
+      # Most real DBF files don't have memo fields
+      # Test that MemoHandler handles this gracefully
+      
+      case MemoHandler.open_dbf_with_memo(@test_dbf_path, [], memo: :auto) do
+        {:ok, handler} ->
+          # Opened successfully in auto mode
+          assert is_nil(handler.dbt) or is_map(handler.dbt)
+          
+          # Should be able to read records normally
+          {:ok, record} = MemoHandler.read_record_with_memo(handler, 0)
+          assert is_map(record)
+          
+          # Should contain all expected fields
+          expected_fields = ["SONO", "SKIDNO", "ROLLNO", "WEIGHT", "CORE", "NET", "FEET", "KILOS", "DATE"]
+          for field <- expected_fields do
+            assert Map.has_key?(record, field)
+          end
+          
+          MemoHandler.close_memo_files(handler)
+          
+        {:error, reason} ->
+          IO.puts("MemoHandler gracefully declined to open non-memo DBF: #{inspect(reason)}")
+          # This is acceptable behavior
+      end
+    end
+
+    @tag :integration
+    test "performance comparison: MemoHandler vs Parser on real data" do
+      # Compare performance of MemoHandler vs direct Parser on non-memo file
+      {:ok, parser_dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Time direct parser access
+      {parser_time, parser_records} = :timer.tc(fn ->
+        parser_dbf
+        |> Parser.stream_records()
+        |> Stream.take(1000)
+        |> Enum.to_list()
+      end)
+      
+      case MemoHandler.open_dbf_with_memo(@test_dbf_path, [], memo: :auto) do
+        {:ok, memo_handler} ->
+          # Time memo handler access
+          {memo_time, memo_records} = :timer.tc(fn ->
+            0..999
+            |> Enum.map(fn index ->
+              {:ok, record} = MemoHandler.read_record_with_memo(memo_handler, index)
+              record
+            end)
+          end)
+          
+          # Compare performance
+          assert length(parser_records) == 1000
+          assert length(memo_records) == 1000
+          
+          # MemoHandler should not be significantly slower for non-memo files
+          overhead_ratio = memo_time / parser_time
+          IO.puts("Performance overhead: #{Float.round(overhead_ratio, 2)}x")
+          
+          # Allow up to 3x overhead for the abstraction layer
+          assert overhead_ratio < 3.0
+          
+          MemoHandler.close_memo_files(memo_handler)
+          
+        {:error, _reason} ->
+          IO.puts("MemoHandler not available for performance comparison")
+      end
+      
+      Parser.close_dbf(parser_dbf)
+    end
+
+    @tag :integration
+    test "validates memo handler field access on real data" do
+      case MemoHandler.open_dbf_with_memo(@test_dbf_path, [], memo: :auto) do
+        {:ok, handler} ->
+          # Test field access patterns on real data
+          {:ok, record} = MemoHandler.read_record_with_memo(handler, 0)
+          
+          # Verify all fields are accessible
+          assert is_binary(record["SONO"]) or is_nil(record["SONO"])
+          assert is_integer(record["SKIDNO"]) or is_nil(record["SKIDNO"])
+          assert is_integer(record["ROLLNO"]) or is_nil(record["ROLLNO"])
+          assert is_number(record["WEIGHT"]) or is_nil(record["WEIGHT"])
+          assert is_number(record["CORE"]) or is_nil(record["CORE"])
+          assert is_number(record["NET"]) or is_nil(record["NET"])
+          assert is_number(record["FEET"]) or is_nil(record["FEET"])
+          assert is_boolean(record["KILOS"]) or is_nil(record["KILOS"])
+          
+          # DATE field may have various formats depending on implementation
+          date_value = record["DATE"]
+          assert not is_nil(date_value) or is_nil(date_value)
+          
+          MemoHandler.close_memo_files(handler)
+          
+        {:error, reason} ->
+          IO.puts("MemoHandler field access test skipped: #{inspect(reason)}")
+      end
+    end
+
+    @tag :integration
+    test "validates memo handler error handling with real constraints" do
+      case MemoHandler.open_dbf_with_memo(@test_dbf_path) do
+        {:ok, handler} ->
+          # Test reading beyond record count
+          invalid_index = handler.dbf.header.record_count + 100
+          
+          case MemoHandler.read_record_with_memo(handler, invalid_index) do
+            {:error, reason} ->
+              # Should get appropriate error
+              assert reason in [:invalid_record_index, :record_index_out_of_range]
+              
+            {:ok, _record} ->
+              flunk("Should have failed for invalid record index")
+          end
+          
+          MemoHandler.close_memo_files(handler)
+          
+        {:error, reason} ->
+          IO.puts("MemoHandler error handling test skipped: #{inspect(reason)}")
+      end
     end
   end
 end

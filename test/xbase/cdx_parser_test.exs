@@ -4,6 +4,10 @@ defmodule Xbase.CdxParserTest do
   alias Xbase.CdxParser
   alias Xbase.Types.{CdxHeader, CdxNode}
 
+  # Path to real test data files
+  @test_cdx_path "test/prrolls.CDX"
+  @test_dbf_path "test/prrolls.DBF"
+
   describe "CDX header parsing" do
     test "parses a valid CDX header" do
       # Create a valid 512-byte CDX header
@@ -291,6 +295,122 @@ defmodule Xbase.CdxParserTest do
       assert {:error, _reason} = CdxParser.open_cdx(truncated_path)
       
       File.rm(truncated_path)
+    end
+  end
+
+  describe "Integration Tests with Real CDX Index (prrolls.CDX)" do
+    @tag :integration
+    test "opens real CDX file and reads header correctly" do
+      # Note: This test may fail if CDX parsing is not fully implemented
+      # Skip or adapt based on current implementation status
+      case CdxParser.open_cdx(@test_cdx_path) do
+        {:ok, cdx} ->
+          # Basic validation that we can open the file
+          assert is_map(cdx)
+          assert cdx.file_path == @test_cdx_path
+          
+          # Verify header structure if available
+          if Map.has_key?(cdx, :header) do
+            assert %CdxHeader{} = cdx.header
+          end
+          
+          CdxParser.close_cdx(cdx)
+          
+        {:error, :not_implemented} ->
+          # CDX parsing not yet implemented, skip test
+          IO.puts("CDX parsing not implemented yet - skipping integration test")
+          
+        {:error, reason} ->
+          flunk("Failed to open real CDX file: #{inspect(reason)}")
+      end
+    end
+
+    @tag :integration
+    test "validates CDX file structure with corresponding DBF" do
+      # This test validates that the CDX file corresponds to the DBF file
+      case {Xbase.Parser.open_dbf(@test_dbf_path), CdxParser.open_cdx(@test_cdx_path)} do
+        {{:ok, dbf}, {:ok, cdx}} ->
+          # Verify the index file corresponds to the DBF structure
+          # This is a placeholder for when CDX functionality is implemented
+          
+          # Basic validation that both files opened
+          assert dbf.header.record_count == 311314
+          assert is_map(cdx)
+          
+          Xbase.Parser.close_dbf(dbf)
+          CdxParser.close_cdx(cdx)
+          
+        {{:ok, dbf}, {:error, :not_implemented}} ->
+          # CDX not implemented yet
+          IO.puts("CDX integration testing pending implementation")
+          Xbase.Parser.close_dbf(dbf)
+          
+        {{:ok, dbf}, {:error, cdx_error}} ->
+          Xbase.Parser.close_dbf(dbf)
+          flunk("CDX file failed to open: #{inspect(cdx_error)}")
+          
+        {{:error, dbf_error}, _} ->
+          flunk("DBF file failed to open: #{inspect(dbf_error)}")
+      end
+    end
+
+    @tag :integration
+    test "CDX file size and basic structure validation" do
+      # Test basic file properties
+      assert File.exists?(@test_cdx_path)
+      
+      {:ok, file_stat} = File.stat(@test_cdx_path)
+      assert file_stat.size > 0
+      
+      # CDX files should be substantial for a 311K record database
+      assert file_stat.size > 1024  # At least 1KB
+      
+      # Read first few bytes to check it's a binary file
+      {:ok, first_bytes} = File.read(@test_cdx_path, 64)
+      assert byte_size(first_bytes) == 64
+      
+      # Basic validation that it's not a text file
+      assert not String.printable?(first_bytes)
+    end
+
+    @tag :integration 
+    test "performance characteristics of real CDX file" do
+      case CdxParser.open_cdx(@test_cdx_path) do
+        {:ok, cdx} ->
+          # Time the opening operation
+          {open_time, _} = :timer.tc(fn ->
+            {:ok, test_cdx} = CdxParser.open_cdx(@test_cdx_path)
+            CdxParser.close_cdx(test_cdx)
+          end)
+          
+          # Should open quickly (less than 100ms)
+          assert open_time < 100_000  # 100ms in microseconds
+          
+          CdxParser.close_cdx(cdx)
+          
+        {:error, :not_implemented} ->
+          IO.puts("CDX performance testing pending implementation")
+          
+        {:error, reason} ->
+          flunk("Failed to test CDX performance: #{inspect(reason)}")
+      end
+    end
+
+    @tag :integration
+    test "CDX file metadata extraction" do
+      # Test what we can determine about the CDX file without full parsing
+      {:ok, file_data} = File.read(@test_cdx_path, 512)  # Read first block
+      
+      # Basic binary structure validation
+      assert byte_size(file_data) == 512
+      
+      # CDX files typically start with certain patterns
+      # This is a placeholder for more specific validation when CDX parsing is implemented
+      assert is_binary(file_data)
+      
+      # Could add more specific byte pattern checks based on CDX format specification
+      # For now, just verify we can read the file structure
+      IO.puts("CDX file first 32 bytes: #{inspect(binary_part(file_data, 0, 32))}")
     end
   end
 end

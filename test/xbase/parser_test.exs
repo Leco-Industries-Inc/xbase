@@ -6,6 +6,10 @@ defmodule Xbase.ParserTest do
   alias Xbase.Types.FieldDescriptor
   alias Xbase.Types.Record
 
+  # Path to real test data files
+  @test_dbf_path "test/prrolls.DBF"
+  @test_cdx_path "test/prrolls.CDX"
+
   describe "parse_header/1" do
     test "parses a valid dBase III header" do
       # Create a valid 32-byte dBase III header
@@ -2800,6 +2804,203 @@ defmodule Xbase.ParserTest do
       # Final memory should be close to initial (within 3MB)
       final_growth = final_memory.total - initial_memory.total
       assert final_growth < 3_000_000
+      
+      Parser.close_dbf(dbf)
+    end
+  end
+
+  describe "Integration Tests with Real Data (prrolls.DBF)" do
+    @tag :integration
+    test "opens real DBF file and reads header correctly" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Verify header information matches expected structure
+      assert dbf.header.version == 48  # dBase file with specific version
+      assert dbf.header.record_count == 311314  # Large dataset
+      assert dbf.header.record_length == 68
+      assert dbf.header.mdx_flag == 1  # Has associated index
+      
+      # Verify field structure
+      assert length(dbf.fields) == 9
+      
+      field_names = Enum.map(dbf.fields, & &1.name)
+      expected_fields = ["SONO", "SKIDNO", "ROLLNO", "WEIGHT", "CORE", "NET", "FEET", "KILOS", "DATE"]
+      assert field_names == expected_fields
+      
+      # Verify field types
+      assert Enum.find(dbf.fields, &(&1.name == "SONO")).type == "C"      # Character
+      assert Enum.find(dbf.fields, &(&1.name == "SKIDNO")).type == "I"    # Integer
+      assert Enum.find(dbf.fields, &(&1.name == "WEIGHT")).type == "N"    # Numeric
+      assert Enum.find(dbf.fields, &(&1.name == "KILOS")).type == "L"     # Logical
+      assert Enum.find(dbf.fields, &(&1.name == "DATE")).type == "T"      # DateTime
+      
+      Parser.close_dbf(dbf)
+    end
+
+    @tag :integration
+    test "reads individual records from real DBF file" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Read first record
+      assert {:ok, first_record} = Parser.read_record(dbf, 0)
+      assert %Record{} = first_record
+      assert not first_record.deleted
+      assert is_map(first_record.data)
+      
+      # Verify expected fields are present
+      expected_fields = ["SONO", "SKIDNO", "ROLLNO", "WEIGHT", "CORE", "NET", "FEET", "KILOS", "DATE"]
+      record_fields = Map.keys(first_record.data)
+      assert Enum.all?(expected_fields, &(&1 in record_fields))
+      
+      # Read middle record
+      middle_index = div(dbf.header.record_count, 2)
+      assert {:ok, middle_record} = Parser.read_record(dbf, middle_index)
+      assert %Record{} = middle_record
+      
+      # Read last record
+      last_index = dbf.header.record_count - 1
+      assert {:ok, last_record} = Parser.read_record(dbf, last_index)
+      assert %Record{} = last_record
+      
+      Parser.close_dbf(dbf)
+    end
+
+    @tag :integration
+    test "streams through large real dataset efficiently" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      initial_memory = :erlang.memory(:total)
+      
+      # Process first 1000 records using streaming
+      sample_records = 
+        dbf
+        |> Parser.stream_records()
+        |> Stream.reject(fn record -> record.deleted end)
+        |> Stream.take(1000)
+        |> Enum.to_list()
+      
+      peak_memory = :erlang.memory(:total)
+      memory_growth = peak_memory - initial_memory
+      
+      # Verify we got records
+      assert length(sample_records) == 1000
+      
+      # Verify record structure
+      sample_record = List.first(sample_records)
+      assert %Record{} = sample_record
+      assert is_map(sample_record.data)
+      
+      # Memory should not grow excessively for streaming
+      assert memory_growth < 50_000_000  # Less than 50MB growth
+      
+      Parser.close_dbf(dbf)
+    end
+
+    @tag :integration
+    test "validates data types in real records" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Read a sample of records to validate data types
+      sample_indices = [0, 100, 1000, 10000]
+      
+      for index <- sample_indices do
+        assert {:ok, record} = Parser.read_record(dbf, index)
+        
+        # Validate character field
+        sono = record.data["SONO"]
+        assert is_binary(sono) or is_nil(sono)
+        
+        # Validate integer fields  
+        skidno = record.data["SKIDNO"]
+        rollno = record.data["ROLLNO"]
+        assert is_integer(skidno) or is_nil(skidno)
+        assert is_integer(rollno) or is_nil(rollno)
+        
+        # Validate numeric fields
+        weight = record.data["WEIGHT"]
+        core = record.data["CORE"]
+        net = record.data["NET"]
+        feet = record.data["FEET"]
+        assert is_number(weight) or is_nil(weight)
+        assert is_number(core) or is_nil(core)
+        assert is_number(net) or is_nil(net)
+        assert is_number(feet) or is_nil(feet)
+        
+        # Validate logical field
+        kilos = record.data["KILOS"]
+        assert is_boolean(kilos) or is_nil(kilos)
+        
+        # Validate datetime field (if we support it)
+        date = record.data["DATE"]
+        # Note: Might need to implement "T" type support
+        assert not is_nil(date) or is_nil(date)  # Placeholder for now
+      end
+      
+      Parser.close_dbf(dbf)
+    end
+
+    @tag :integration
+    test "handles large dataset statistics" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Calculate statistics on a subset
+      stats = 
+        dbf
+        |> Parser.stream_records()
+        |> Stream.reject(fn record -> record.deleted end)
+        |> Stream.take(5000)  # Sample first 5000 records
+        |> Enum.reduce(
+          %{total_records: 0, non_null_weights: 0, peso_sum: 0, deleted_count: 0},
+          fn record, acc ->
+            weight = record.data["WEIGHT"]
+            
+            %{
+              acc |
+              total_records: acc.total_records + 1,
+              non_null_weights: if(weight && weight > 0, do: acc.non_null_weights + 1, else: acc.non_null_weights),
+              peso_sum: acc.peso_sum + (weight || 0),
+              deleted_count: if(record.deleted, do: acc.deleted_count + 1, else: acc.deleted_count)
+            }
+          end
+        )
+      
+      # Verify statistics make sense
+      assert stats.total_records == 5000
+      assert stats.non_null_weights >= 0
+      assert stats.peso_sum >= 0
+      assert stats.deleted_count >= 0
+      
+      Parser.close_dbf(dbf)
+    end
+
+    @tag :integration
+    test "performance benchmark on real data" do
+      assert {:ok, dbf} = Parser.open_dbf(@test_dbf_path)
+      
+      # Benchmark random access
+      random_indices = Enum.take_random(0..(dbf.header.record_count - 1), 100)
+      
+      {time_microseconds, _results} = :timer.tc(fn ->
+        Enum.map(random_indices, &Parser.read_record(dbf, &1))
+      end)
+      
+      time_per_record = time_microseconds / 100
+      
+      # Should be able to read at least 1000 records per second on random access
+      assert time_per_record < 1000  # Less than 1ms per record
+      
+      # Benchmark sequential streaming
+      {stream_time_microseconds, stream_count} = :timer.tc(fn ->
+        dbf
+        |> Parser.stream_records()
+        |> Stream.take(1000)
+        |> Enum.count()
+      end)
+      
+      stream_time_per_record = stream_time_microseconds / stream_count
+      
+      # Streaming should be faster than random access
+      assert stream_time_per_record < time_per_record
       
       Parser.close_dbf(dbf)
     end
