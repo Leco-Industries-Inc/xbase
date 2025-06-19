@@ -151,6 +151,126 @@ defmodule Xbase.FieldEncoderTest do
     end
   end
 
+  describe "Integer field encoding (type I)" do
+    test "encodes positive integer to binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = 1000
+      
+      assert {:ok, <<1000::little-signed-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "encodes negative integer to binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = -500
+      
+      assert {:ok, <<-500::little-signed-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "encodes zero integer to binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = 0
+      
+      assert {:ok, <<0::little-signed-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "handles nil integer field" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = nil
+      
+      assert {:ok, <<0::little-signed-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "converts float to integer" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = 42.7
+      
+      assert {:ok, <<42::little-signed-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "returns error for integer out of range" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = 3_000_000_000  # Larger than 32-bit signed integer max
+      
+      assert {:error, :integer_out_of_range} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "returns error for invalid integer type" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      value = "not an integer"
+      
+      assert {:error, :invalid_type} = FieldEncoder.encode(field_desc, value)
+    end
+  end
+
+  describe "DateTime field encoding (type T)" do
+    test "encodes datetime to Julian day and milliseconds" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      # 2024-03-15 14:30:45.123 UTC
+      datetime = DateTime.new!(~D[2024-03-15], ~T[14:30:45.123], "Etc/UTC")
+      
+      assert {:ok, binary_result} = FieldEncoder.encode(field_desc, datetime)
+      assert byte_size(binary_result) == 8
+      
+      # Verify we can parse it back
+      alias Xbase.FieldParser
+      assert {:ok, parsed_datetime} = FieldParser.parse(field_desc, binary_result)
+      assert parsed_datetime.year == 2024
+      assert parsed_datetime.month == 3
+      assert parsed_datetime.day == 15
+      assert parsed_datetime.hour == 14
+      assert parsed_datetime.minute == 30
+      assert parsed_datetime.second == 45
+    end
+
+    test "encodes naive datetime" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      naive_datetime = NaiveDateTime.new!(~D[2024-01-01], ~T[00:00:00])
+      
+      assert {:ok, binary_result} = FieldEncoder.encode(field_desc, naive_datetime)
+      assert byte_size(binary_result) == 8
+      
+      # Verify round-trip
+      alias Xbase.FieldParser
+      assert {:ok, parsed_datetime} = FieldParser.parse(field_desc, binary_result)
+      assert parsed_datetime.year == 2024
+      assert parsed_datetime.month == 1
+      assert parsed_datetime.day == 1
+      assert parsed_datetime.hour == 0
+      assert parsed_datetime.minute == 0
+      assert parsed_datetime.second == 0
+    end
+
+    test "handles nil datetime field" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      value = nil
+      
+      assert {:ok, <<0::little-32, 0::little-32>>} = FieldEncoder.encode(field_desc, value)
+    end
+
+    test "handles timezone conversion" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      # Create datetime already in a known timezone (UTC)
+      utc_datetime = DateTime.new!(~D[2024-03-15], ~T[15:30:45], "Etc/UTC")
+      
+      assert {:ok, binary_result} = FieldEncoder.encode(field_desc, utc_datetime)
+      
+      # Verify it's properly encoded and can be parsed back
+      alias Xbase.FieldParser
+      assert {:ok, parsed_datetime} = FieldParser.parse(field_desc, binary_result)
+      assert parsed_datetime.time_zone == "Etc/UTC"
+      assert parsed_datetime.hour == 15
+      assert parsed_datetime.minute == 30
+      assert parsed_datetime.second == 45
+    end
+
+    test "returns error for invalid datetime type" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      value = "2024-03-15 14:30:45"  # String instead of DateTime
+      
+      assert {:error, :invalid_type} = FieldEncoder.encode(field_desc, value)
+    end
+  end
+
   describe "Unknown field types" do
     test "returns error for unknown field type" do
       field_desc = %FieldDescriptor{name: "UNKNOWN", type: "X", length: 5, decimal_count: 0}
@@ -199,6 +319,35 @@ defmodule Xbase.FieldEncoderTest do
       {:ok, decoded} = Xbase.FieldParser.parse(field_desc, encoded)
       
       assert decoded == original_value
+    end
+
+    test "integer field round trip" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      original_value = 42000
+      
+      {:ok, encoded} = FieldEncoder.encode(field_desc, original_value)
+      {:ok, decoded} = Xbase.FieldParser.parse(field_desc, encoded)
+      
+      assert decoded == original_value
+    end
+
+    test "datetime field round trip" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      original_value = DateTime.new!(~D[2024-03-15], ~T[14:30:45.123], "Etc/UTC")
+      
+      {:ok, encoded} = FieldEncoder.encode(field_desc, original_value)
+      {:ok, decoded} = Xbase.FieldParser.parse(field_desc, encoded)
+      
+      # Compare main components (microsecond precision might differ slightly)
+      assert decoded.year == original_value.year
+      assert decoded.month == original_value.month
+      assert decoded.day == original_value.day
+      assert decoded.hour == original_value.hour
+      assert decoded.minute == original_value.minute
+      assert decoded.second == original_value.second
+      # Check millisecond precision (123 milliseconds)
+      {microseconds, _} = decoded.microsecond
+      assert div(microseconds, 1000) == 123
     end
   end
 end

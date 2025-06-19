@@ -133,8 +133,109 @@ defmodule Xbase.FieldEncoder do
     end
   end
 
+  def encode(%FieldDescriptor{type: "I", length: 4} = _field_desc, value) do
+    # Integer field: 4-byte signed little-endian integer
+    case value do
+      nil -> 
+        # Null integer represented as zero
+        {:ok, <<0::little-signed-32>>}
+      val when is_integer(val) ->
+        # Check if value fits in 32-bit signed integer range
+        if val >= -2_147_483_648 and val <= 2_147_483_647 do
+          {:ok, <<val::little-signed-32>>}
+        else
+          {:error, :integer_out_of_range}
+        end
+      val when is_float(val) ->
+        # Convert float to integer
+        int_val = trunc(val)
+        if int_val >= -2_147_483_648 and int_val <= 2_147_483_647 do
+          {:ok, <<int_val::little-signed-32>>}
+        else
+          {:error, :integer_out_of_range}
+        end
+      _ ->
+        {:error, :invalid_type}
+    end
+  end
+
+  def encode(%FieldDescriptor{type: "T", length: 8} = _field_desc, value) do
+    # DateTime field: 8-byte timestamp (Julian day + milliseconds since midnight)
+    case value do
+      nil -> 
+        # Null datetime represented as zeros
+        {:ok, <<0::little-32, 0::little-32>>}
+      %DateTime{} = datetime ->
+        # Convert datetime to UTC if not already
+        utc_datetime = DateTime.shift_zone!(datetime, "Etc/UTC")
+        
+        # Extract date and time components
+        date_part = Date.new!(utc_datetime.year, utc_datetime.month, utc_datetime.day)
+        time_part = Time.new!(utc_datetime.hour, utc_datetime.minute, utc_datetime.second, utc_datetime.microsecond)
+        
+        # Convert to Julian day and milliseconds
+        case date_to_julian(date_part) do
+          {:ok, julian_day} ->
+            case time_to_milliseconds(time_part) do
+              {:ok, milliseconds} ->
+                {:ok, <<julian_day::little-32, milliseconds::little-32>>}
+              {:error, reason} -> {:error, reason}
+            end
+          {:error, reason} -> {:error, reason}
+        end
+      %NaiveDateTime{} = naive_datetime ->
+        # Treat naive datetime as UTC
+        date_part = Date.new!(naive_datetime.year, naive_datetime.month, naive_datetime.day)
+        time_part = Time.new!(naive_datetime.hour, naive_datetime.minute, naive_datetime.second, naive_datetime.microsecond)
+        
+        case date_to_julian(date_part) do
+          {:ok, julian_day} ->
+            case time_to_milliseconds(time_part) do
+              {:ok, milliseconds} ->
+                {:ok, <<julian_day::little-32, milliseconds::little-32>>}
+              {:error, reason} -> {:error, reason}
+            end
+          {:error, reason} -> {:error, reason}
+        end
+      _ ->
+        {:error, :invalid_type}
+    end
+  end
+
   def encode(%FieldDescriptor{type: _type} = _field_desc, _value) do
     # Unknown field type
     {:error, :unknown_field_type}
+  end
+
+  # Helper function to convert date to Julian day number
+  defp date_to_julian(%Date{year: year, month: month, day: day}) do
+    try do
+      # Algorithm from "Astronomical Algorithms" by Jean Meeus
+      # Handles the conversion from Gregorian calendar to Julian day number
+      a = div(14 - month, 12)
+      y = year + 4800 - a
+      m = month + 12 * a - 3
+      
+      julian_day = day + div(153 * m + 2, 5) + 365 * y + div(y, 4) - div(y, 100) + div(y, 400) - 32045
+      
+      {:ok, julian_day}
+    rescue
+      _ -> {:error, :invalid_date_conversion}
+    end
+  end
+
+  # Helper function to convert time to milliseconds since midnight
+  defp time_to_milliseconds(%Time{hour: hour, minute: minute, second: second, microsecond: {microsecond, _}}) do
+    try do
+      total_milliseconds = (hour * 3600 + minute * 60 + second) * 1000 + div(microsecond, 1000)
+      
+      if total_milliseconds >= 0 and total_milliseconds < 86_400_000 do
+        {:ok, total_milliseconds}
+      else
+        {:error, :invalid_time_range}
+      end
+    rescue
+      _ -> {:error, :invalid_time_conversion}
+    end
   end
 end

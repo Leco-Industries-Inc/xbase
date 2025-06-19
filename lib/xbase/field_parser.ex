@@ -105,8 +105,93 @@ defmodule Xbase.FieldParser do
     end
   end
 
+  def parse(%FieldDescriptor{type: "I"} = _field_desc, binary_data) do
+    # Integer field: 4-byte signed little-endian integer
+    case byte_size(binary_data) do
+      4 ->
+        <<value::little-signed-32>> = binary_data
+        {:ok, value}
+      _ ->
+        {:error, :invalid_integer_size}
+    end
+  end
+
+  def parse(%FieldDescriptor{type: "T"} = _field_desc, binary_data) do
+    # DateTime field: 8-byte timestamp (Julian day + milliseconds since midnight)
+    case byte_size(binary_data) do
+      8 ->
+        <<julian_day::little-32, milliseconds::little-32>> = binary_data
+        
+        # Handle empty/null datetime (often represented as all zeros)
+        case {julian_day, milliseconds} do
+          {0, 0} -> {:ok, nil}
+          _ ->
+            # Convert Julian day to date
+            case julian_to_date(julian_day) do
+              {:ok, date} ->
+                # Convert milliseconds to time
+                case milliseconds_to_time(milliseconds) do
+                  {:ok, time} ->
+                    # Combine date and time into datetime
+                    case DateTime.new(date, time, "Etc/UTC") do
+                      {:ok, datetime} -> {:ok, datetime}
+                      {:error, _} -> {:error, :invalid_datetime}
+                    end
+                  {:error, reason} -> {:error, reason}
+                end
+              {:error, reason} -> {:error, reason}
+            end
+        end
+      _ ->
+        {:error, :invalid_datetime_size}
+    end
+  end
+
   def parse(%FieldDescriptor{type: _type} = _field_desc, _binary_data) do
     # Unknown field type
     {:error, :unknown_field_type}
+  end
+
+  # Helper function to convert Julian day number to date
+  defp julian_to_date(julian_day) do
+    # Julian day calculation based on astronomical Julian day
+    # This handles the conversion from Julian day number to Gregorian calendar
+    try do
+      # Algorithm from "Astronomical Algorithms" by Jean Meeus
+      a = julian_day + 32044
+      b = div(4 * a + 3, 146097)
+      c = a - div(146097 * b, 4)
+      d = div(4 * c + 3, 1461)
+      e = c - div(1461 * d, 4)
+      m = div(5 * e + 2, 153)
+      
+      day = e - div(153 * m + 2, 5) + 1
+      month = m + 3 - 12 * div(m, 10)
+      year = 100 * b + d - 4800 + div(m, 10)
+      
+      Date.new(year, month, day)
+    rescue
+      _ -> {:error, :invalid_julian_day}
+    end
+  end
+
+  # Helper function to convert milliseconds since midnight to time
+  defp milliseconds_to_time(milliseconds) do
+    # Ensure milliseconds is within valid range (0 to 86399999 for 24 hours)
+    if milliseconds >= 0 and milliseconds < 86_400_000 do
+      total_seconds = div(milliseconds, 1000)
+      remaining_milliseconds = rem(milliseconds, 1000)
+      
+      hours = div(total_seconds, 3600)
+      minutes = div(rem(total_seconds, 3600), 60)
+      seconds = rem(total_seconds, 60)
+      
+      # Convert milliseconds to microseconds for Time.new/4
+      microseconds = remaining_milliseconds * 1000
+      
+      Time.new(hours, minutes, seconds, microseconds)
+    else
+      {:error, :invalid_time_milliseconds}
+    end
   end
 end

@@ -133,6 +133,87 @@ defmodule Xbase.FieldParserTest do
     end
   end
 
+  describe "Integer field parsing (type I)" do
+    test "parses positive integer from binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      binary_data = <<1000::little-signed-32>>  # 4-byte little-endian integer
+      
+      assert {:ok, 1000} = FieldParser.parse(field_desc, binary_data)
+    end
+
+    test "parses negative integer from binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      binary_data = <<-500::little-signed-32>>  # Negative integer
+      
+      assert {:ok, -500} = FieldParser.parse(field_desc, binary_data)
+    end
+
+    test "parses zero integer from binary" do
+      field_desc = %FieldDescriptor{name: "ID", type: "I", length: 4, decimal_count: 0}
+      binary_data = <<0::little-signed-32>>  # Zero
+      
+      assert {:ok, 0} = FieldParser.parse(field_desc, binary_data)
+    end
+
+    test "returns error for wrong size integer field" do
+      field_desc = %FieldDescriptor{name: "BAD", type: "I", length: 4, decimal_count: 0}
+      binary_data = <<"ABC">>  # Wrong size (3 bytes instead of 4)
+      
+      assert {:error, :invalid_integer_size} = FieldParser.parse(field_desc, binary_data)
+    end
+  end
+
+  describe "DateTime field parsing (type T)" do
+    test "parses datetime from Julian day and milliseconds" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      
+      # Julian day for 2024-03-15 (2460385) + 14:30:45.123 (52245123 milliseconds)
+      julian_day = 2460385
+      milliseconds = 14 * 3600 * 1000 + 30 * 60 * 1000 + 45 * 1000 + 123  # 52245123
+      binary_data = <<julian_day::little-32, milliseconds::little-32>>
+      
+      assert {:ok, %DateTime{} = result} = FieldParser.parse(field_desc, binary_data)
+      assert result.year == 2024
+      assert result.month == 3
+      assert result.day == 15
+      assert result.hour == 14
+      assert result.minute == 30
+      assert result.second == 45
+      assert result.microsecond == {123000, 6}  # 123 milliseconds = 123000 microseconds
+    end
+
+    test "handles null datetime (all zeros)" do
+      field_desc = %FieldDescriptor{name: "TIMESTAMP", type: "T", length: 8, decimal_count: 0}
+      binary_data = <<0::little-32, 0::little-32>>  # Null datetime
+      
+      assert {:ok, nil} = FieldParser.parse(field_desc, binary_data)
+    end
+
+    test "returns error for wrong size datetime field" do
+      field_desc = %FieldDescriptor{name: "BAD_TIME", type: "T", length: 8, decimal_count: 0}
+      binary_data = <<"ABCDEF">>  # Wrong size (6 bytes instead of 8)
+      
+      assert {:error, :invalid_datetime_size} = FieldParser.parse(field_desc, binary_data)
+    end
+
+    test "handles datetime at midnight" do
+      field_desc = %FieldDescriptor{name: "MIDNIGHT", type: "T", length: 8, decimal_count: 0}
+      
+      # Julian day for 2024-01-01 + 0 milliseconds (midnight)
+      julian_day = 2460311
+      milliseconds = 0
+      binary_data = <<julian_day::little-32, milliseconds::little-32>>
+      
+      assert {:ok, %DateTime{} = result} = FieldParser.parse(field_desc, binary_data)
+      assert result.year == 2024
+      assert result.month == 1
+      assert result.day == 1
+      assert result.hour == 0
+      assert result.minute == 0
+      assert result.second == 0
+    end
+  end
+
   describe "Unknown field types" do
     test "returns error for unknown field type" do
       field_desc = %FieldDescriptor{name: "UNKNOWN", type: "X", length: 5, decimal_count: 0}
@@ -365,7 +446,8 @@ defmodule Xbase.FieldParserTest do
     defp calculate_field_offset(fields, target_field_name) do
       fields
       |> Enum.take_while(&(&1.name != target_field_name))
-      |> Enum.sum(& &1.length)
+      |> Enum.map(& &1.length)
+      |> Enum.sum()
     end
   end
 end
