@@ -27,7 +27,7 @@ defmodule Xbase.CdxParser do
 
   def parse_header(header_binary) do
     case header_binary do
-      <<root_node::little-32, free_list::little-32, version::little-32,
+      <<root_node::little-32, free_list::little-signed-32, version::little-32,
         key_length::little-16, index_options, signature,
         _reserved::16*8, sort_order::little-16, total_expr_len::little-16,
         for_expr_len::little-16, _reserved2::16, key_expr_len::little-16,
@@ -119,7 +119,7 @@ defmodule Xbase.CdxParser do
   - `{:ok, CdxNode.t()}` - Successfully read node
   - `{:error, reason}` - Error reading node
   """
-  def read_node(%CdxFile{file: file, page_cache: cache} = _cdx_file, page_number) do
+  def read_node(%CdxFile{file: file, page_cache: cache, header: header} = _cdx_file, page_number) do
     # Check cache first
     case :ets.lookup(cache, page_number) do
       [{^page_number, cached_node}] ->
@@ -129,7 +129,7 @@ defmodule Xbase.CdxParser do
         offset = page_number * @page_size
         case :file.pread(file, offset, @page_size) do
           {:ok, page_data} ->
-            case parse_node(page_data) do
+            case parse_node(page_data, header.key_length) do
               {:ok, node} ->
                 # Cache the node
                 :ets.insert(cache, {page_number, node})
@@ -150,23 +150,26 @@ defmodule Xbase.CdxParser do
   
   ## Parameters
   - `page_data` - 512 bytes of page data
+  - `key_length` - Length of keys in this index
   
   ## Returns
   - `{:ok, CdxNode.t()}` - Successfully parsed node
   - `{:error, reason}` - Error parsing node
   """
-  def parse_node(page_data) when byte_size(page_data) != @page_size do
+  def parse_node(page_data, key_length \\ 10)
+  
+  def parse_node(page_data, _key_length) when byte_size(page_data) != @page_size do
     {:error, :invalid_page_size}
   end
 
-  def parse_node(page_data) do
+  def parse_node(page_data, key_length) do
     case page_data do
-      <<attributes::little-16, key_count::little-16, left_brother::little-32,
-        _reserved::16*8, keys_and_pointers::binary>> ->
+      <<attributes::little-16, key_count::little-16, left_brother::little-signed-32,
+        _reserved::binary-size(16), keys_and_pointers::binary>> ->
         
         node_type = determine_node_type(attributes)
         
-        case extract_keys_and_pointers(keys_and_pointers, key_count, node_type) do
+        case extract_keys_and_pointers(keys_and_pointers, key_count, node_type, key_length) do
           {:ok, {keys, pointers}} ->
             {:ok, %CdxNode{
               attributes: attributes,
@@ -237,44 +240,53 @@ defmodule Xbase.CdxParser do
   defp determine_node_type(attributes) do
     import Bitwise
     cond do
+      # Check for root + leaf combination first (root node that is also a leaf)
+      (attributes &&& 0x0003) == 0x0003 -> :leaf  # Root leaf nodes behave as leaf nodes
       (attributes &&& 0x0001) != 0 -> :root
       (attributes &&& 0x0002) != 0 -> :leaf
       true -> :branch
     end
   end
 
-  defp extract_keys_and_pointers(data, key_count, node_type) do
+  defp extract_keys_and_pointers(data, key_count, node_type, key_length) do
     try do
-      {keys, pointers} = parse_keys_and_pointers(data, key_count, node_type, [], [])
+      {keys, pointers} = parse_keys_and_pointers(data, key_count, node_type, key_length, [], [])
       {:ok, {keys, pointers}}
     catch
+      {:error, reason} -> {:error, reason}
       :error, reason -> {:error, reason}
     end
   end
 
-  defp parse_keys_and_pointers(_data, 0, _node_type, keys, pointers) do
+  defp parse_keys_and_pointers(_data, 0, _node_type, _key_length, keys, pointers) do
     {Enum.reverse(keys), Enum.reverse(pointers)}
   end
 
-  defp parse_keys_and_pointers(data, remaining_keys, node_type, keys, pointers) when remaining_keys > 0 do
+  defp parse_keys_and_pointers(data, remaining_keys, node_type, key_length, keys, pointers) when remaining_keys > 0 do
     case node_type do
       :leaf ->
         # Leaf nodes: key_length + record_number(4 bytes)
-        # For simplicity, assuming fixed key length for now
-        key_length = 11  # Length of "CUSTOMER01" etc
         if byte_size(data) >= key_length + 4 do
           <<key_data::binary-size(key_length), record_num::little-32, rest::binary>> = data
-          parse_keys_and_pointers(rest, remaining_keys - 1, node_type, 
+          parse_keys_and_pointers(rest, remaining_keys - 1, node_type, key_length,
                                  [key_data | keys], [record_num | pointers])
         else
           throw({:error, :insufficient_data})
         end
+      :root ->
+        # Root nodes can be leaf or branch - check if it's a leaf root
+        if byte_size(data) >= key_length + 4 do
+          <<key_data::binary-size(key_length), ptr::little-32, rest::binary>> = data
+          parse_keys_and_pointers(rest, remaining_keys - 1, node_type, key_length,
+                                 [key_data | keys], [ptr | pointers])
+        else
+          throw({:error, :insufficient_data})
+        end
       _ ->
-        # Branch/root nodes: key_length + child_pointer(4 bytes)
-        key_length = 11  # Length of "CUSTOMER50" etc
+        # Branch nodes: key_length + child_pointer(4 bytes)
         if byte_size(data) >= key_length + 4 do
           <<key_data::binary-size(key_length), child_ptr::little-32, rest::binary>> = data
-          parse_keys_and_pointers(rest, remaining_keys - 1, node_type,
+          parse_keys_and_pointers(rest, remaining_keys - 1, node_type, key_length,
                                  [key_data | keys], [child_ptr | pointers])
         else
           throw({:error, :insufficient_data})

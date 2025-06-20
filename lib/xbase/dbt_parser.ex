@@ -27,7 +27,7 @@ defmodule Xbase.DbtParser do
 
   def parse_header(header_binary, :dbase_iii) do
     case header_binary do
-      <<next_block::little-32, _unknown::little-32, _unknown2::16, block_size::little-16, _padding::500*8>> ->
+      <<next_block::little-32, _unknown::16, block_size::little-16, _padding::504*8>> ->
         if block_size >= 512 and block_size <= 65536 do
           {:ok, %DbtHeader{
             next_block: next_block,

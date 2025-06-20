@@ -124,7 +124,7 @@ defmodule Xbase.FieldParser do
                 <<value::little-signed-32>> = binary_data
                 {:ok, value}
               _ ->
-                {:error, :invalid_integer_format}
+                {:error, :invalid_integer_size}
             end
         end
     end
@@ -141,7 +141,6 @@ defmodule Xbase.FieldParser do
         case parse_datetime_text(trimmed) do
           {:ok, datetime} -> {:ok, datetime}
           {:error, :truncated_datetime} -> {:ok, nil}  # Treat truncated as null
-          {:error, :invalid_datetime_format} -> {:ok, nil}  # Treat invalid format as null
           {:error, _} ->
             # If text parsing fails, try binary format (8-byte Julian day + milliseconds)
             case byte_size(binary_data) do
@@ -169,7 +168,7 @@ defmodule Xbase.FieldParser do
                     end
                 end
               _ ->
-                {:ok, nil}  # Treat wrong size as null instead of error
+                {:error, :invalid_datetime_size}
             end
         end
     end

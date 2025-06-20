@@ -25,7 +25,7 @@ defmodule Xbase.CdxParserTest do
         20::little-16,       # total expression length
         0::little-16,        # FOR expression length
         0::16,               # reserved
-        10::little-16        # key expression length
+        11::little-16        # key expression length
       >>
       
       # Calculate remaining space and create proper padding
@@ -103,7 +103,7 @@ defmodule Xbase.CdxParserTest do
       assert %CdxNode{} = node
       assert node.node_type == :leaf
       assert node.key_count == 2
-      assert node.left_brother == 4294967295  # -1 as unsigned 32-bit
+      assert node.left_brother == -1
     end
 
     test "parses a valid branch node" do
@@ -169,11 +169,11 @@ defmodule Xbase.CdxParserTest do
       key_expr = "CUSTOMER_ID"
       header_data = <<
         1::little-32,        # root node at page 1
-        -1::little-32,       # no free list
+        -1::little-signed-32,       # no free list
         1::little-32,        # version 1
         10::little-16,       # key length
         0, 0,                # options + signature
-        0::484*8,            # reserved
+        0::16*8,             # reserved (16 bytes)
         0::little-16,        # sort order
         15::little-16,       # total expr length
         0::little-16,        # for expr length
@@ -191,7 +191,7 @@ defmodule Xbase.CdxParserTest do
       root_header = <<
         0x0003::little-16,   # root + leaf flags
         1::little-16,        # one key
-        -1::little-32,       # no left brother
+        -1::little-signed-32,       # no left brother
         0::16*8              # reserved
       >>
       
@@ -366,7 +366,9 @@ defmodule Xbase.CdxParserTest do
       assert file_stat.size > 1024  # At least 1KB
       
       # Read first few bytes to check it's a binary file
-      {:ok, first_bytes} = File.read(@test_cdx_path, 64)
+      {:ok, file} = File.open(@test_cdx_path, [:read, :binary])
+      first_bytes = IO.binread(file, 64)
+      File.close(file)
       assert byte_size(first_bytes) == 64
       
       # Basic validation that it's not a text file
@@ -399,7 +401,9 @@ defmodule Xbase.CdxParserTest do
     @tag :integration
     test "CDX file metadata extraction" do
       # Test what we can determine about the CDX file without full parsing
-      {:ok, file_data} = File.read(@test_cdx_path, 512)  # Read first block
+      {:ok, file} = File.open(@test_cdx_path, [:read, :binary])
+      file_data = IO.binread(file, 512)  # Read first block
+      File.close(file)
       
       # Basic binary structure validation
       assert byte_size(file_data) == 512
