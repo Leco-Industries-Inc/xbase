@@ -355,7 +355,7 @@ defmodule Xbase.MemoHandlerTest do
       })
       
       transaction_fn = fn h ->
-        {:ok, h1} = MemoHandler.append_record_with_memo(h, %{
+        {:ok, _h1} = MemoHandler.append_record_with_memo(h, %{
           "NAME" => "Transaction User",
           "NOTES" => "Transaction memo"
         })

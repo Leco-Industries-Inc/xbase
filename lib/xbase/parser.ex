@@ -102,13 +102,19 @@ defmodule Xbase.Parser do
   def open_dbf(path, modes) do
     file_modes = modes ++ [:binary, :random]
     
+    # Capture initial file modification time for conflict detection
+    initial_mtime = case File.stat(path) do
+      {:ok, %File.Stat{mtime: mtime}} -> mtime
+      {:error, _} -> nil
+    end
+    
     case :file.open(path, file_modes) do
       {:ok, file} ->
         case read_and_parse_header(file) do
           {:ok, header} ->
             case read_and_parse_fields(file, header) do
               {:ok, fields} ->
-                {:ok, %{header: header, fields: fields, file: file, file_path: path}}
+                {:ok, %{header: header, fields: fields, file: file, file_path: path, initial_mtime: initial_mtime}}
               {:error, reason} ->
                 :file.close(file)
                 {:error, reason}
@@ -296,7 +302,14 @@ defmodule Xbase.Parser do
           {:ok, file} ->
             # Create DBF structure similar to open_dbf
             header = build_header(fields, opts)
-            {:ok, %{header: header, fields: fields, file: file, file_path: path}}
+            
+            # Get initial file modification time
+            initial_mtime = case File.stat(path) do
+              {:ok, %{mtime: mtime}} -> mtime
+              _ -> nil
+            end
+            
+            {:ok, %{header: header, fields: fields, file: file, file_path: path, initial_mtime: initial_mtime}}
           {:error, reason} ->
             {:error, reason}
         end
@@ -410,8 +423,10 @@ defmodule Xbase.Parser do
                 # Write the updated record
                 case :file.pwrite(file, offset, encoded_record) do
                   :ok ->
-                    # Update header timestamp only (not record count)
-                    updated_header = update_header_timestamp(header)
+                    # Update header timestamp and increment transaction flag for conflict detection
+                    updated_header = header
+                    |> update_header_timestamp()
+                    |> increment_transaction_flag()
                     
                     # Write updated header to file
                     case write_header(file, updated_header) do
@@ -762,8 +777,10 @@ defmodule Xbase.Parser do
             # Write all updates in batch
             case batch_write_record_updates(file, encoded_updates) do
               :ok ->
-                # Update header timestamp
-                updated_header = update_header_timestamp(header)
+                # Update header timestamp and increment transaction flag for conflict detection
+                updated_header = header
+                |> update_header_timestamp()
+                |> increment_transaction_flag()
                 case write_header(file, updated_header) do
                   :ok ->
                     {:ok, %{dbf | header: updated_header}}
@@ -826,11 +843,20 @@ defmodule Xbase.Parser do
       {:ok, refreshed_dbf}
   """
   def refresh_dbf_state(%{file: file, file_path: file_path} = _dbf) do
+    # Seek to beginning of file
+    :file.position(file, 0)
+    
     case read_and_parse_header(file) do
       {:ok, header} ->
         case read_and_parse_fields(file, header) do
           {:ok, fields} ->
-            {:ok, %{header: header, fields: fields, file: file, file_path: file_path}}
+            # Get the current file modification time
+            initial_mtime = case File.stat(file_path) do
+              {:ok, %{mtime: mtime}} -> mtime
+              _ -> nil
+            end
+            
+            {:ok, %{header: header, fields: fields, file: file, file_path: file_path, initial_mtime: initial_mtime}}
           {:error, reason} ->
             {:error, reason}
         end
@@ -1317,6 +1343,13 @@ defmodule Xbase.Parser do
     }
   end
 
+  defp increment_transaction_flag(header) do
+    # Use transaction_flag as a write counter for conflict detection
+    # Wrap around at 255 to stay within byte range
+    new_flag = rem(header.transaction_flag + 1, 256)
+    %{header | transaction_flag: new_flag}
+  end
+
   def write_header(file, header) do
     header_binary = <<
       header.version,
@@ -1335,7 +1368,13 @@ defmodule Xbase.Parser do
       0::16                               # reserved
     >>
     
-    :file.pwrite(file, 0, header_binary)
+    case :file.pwrite(file, 0, header_binary) do
+      :ok ->
+        # Sync to ensure changes are written to disk for conflict detection
+        :file.sync(file)
+      error ->
+        error
+    end
   end
 
   defp read_records_recursive(_dbf, index, max, acc) when index >= max do
@@ -1366,8 +1405,10 @@ defmodule Xbase.Parser do
     # Write just the deletion flag
     case :file.pwrite(file, offset, deletion_flag) do
       :ok ->
-        # Update header timestamp
-        updated_header = update_header_timestamp(header)
+        # Update header timestamp and increment transaction flag for conflict detection
+        updated_header = header
+        |> update_header_timestamp()
+        |> increment_transaction_flag()
         
         # Write updated header to file
         case write_header(file, updated_header) do
@@ -1488,60 +1529,56 @@ defmodule Xbase.Parser do
     end
   end
 
-  defp check_for_write_conflict(%{header: cached_header, file: file, file_path: file_path} = _dbf) do
-    # Save current file position
-    {:ok, current_pos} = :file.position(file, :cur)
-    
-    # Check file modification time as a more precise conflict detection
-    case File.stat(file_path) do
-      {:ok, %File.Stat{mtime: _current_mtime}} ->
-        # Get the file modification time from when we opened the DBF
-        # For this implementation, we'll use header comparison as a fallback
-        # Re-read header from file to check for modifications
-        :file.position(file, 0)  # Go to start of file
-        
-        result = case :file.read(file, 32) do
-          {:ok, header_binary} ->
-            case parse_header(header_binary) do
-              {:ok, current_header} ->
-                # For update operations that don't change record count,
-                # use a stricter comparison including all header fields
-                if headers_match_exactly(cached_header, current_header) do
-                  :ok
-                else
-                  {:error, :write_conflict}
-                end
-              {:error, _reason} ->
-                # If we can't parse the header, assume a write conflict occurred
-                {:error, :write_conflict}
-            end
-          {:error, _reason} ->
-            # If we can't read the header, assume a write conflict occurred
-            {:error, :write_conflict}
+  defp check_for_write_conflict(%{file_path: path, initial_mtime: initial_mtime} = dbf) do
+    # First check file modification time
+    case File.stat(path) do
+      {:ok, %{mtime: current_mtime}} ->
+        if current_mtime != initial_mtime do
+          {:error, :write_conflict}
+        else
+          # Also check header for changes
+          check_header_for_conflict(dbf)
         end
-        
-        # Restore file position
-        :file.position(file, current_pos)
-        result
       {:error, _reason} ->
-        # If we can't get file stats, assume a write conflict occurred
         {:error, :write_conflict}
     end
   end
-
-  defp headers_match_exactly(cached_header, current_header) do
-    cached_header.version == current_header.version and
-    cached_header.last_update_year == current_header.last_update_year and
-    cached_header.last_update_month == current_header.last_update_month and
-    cached_header.last_update_day == current_header.last_update_day and
-    cached_header.record_count == current_header.record_count and
-    cached_header.header_length == current_header.header_length and
-    cached_header.record_length == current_header.record_length and
-    cached_header.transaction_flag == current_header.transaction_flag and
-    cached_header.encryption_flag == current_header.encryption_flag and
-    cached_header.mdx_flag == current_header.mdx_flag and
-    cached_header.language_driver == current_header.language_driver
+  
+  defp check_header_for_conflict(%{header: cached_header, file: file} = _dbf) do
+    # Save current file position
+    {:ok, current_pos} = :file.position(file, :cur)
+    
+    # Re-read header from file to check for changes
+    :file.position(file, 0)  # Go to start of file
+    
+    result = case :file.read(file, 32) do
+      {:ok, header_binary} ->
+        case parse_header(header_binary) do
+          {:ok, current_header} ->
+            # Check if header has changed (record count, update date, transaction flag)
+            if cached_header.record_count != current_header.record_count or
+               cached_header.last_update_year != current_header.last_update_year or
+               cached_header.last_update_month != current_header.last_update_month or
+               cached_header.last_update_day != current_header.last_update_day or
+               cached_header.transaction_flag != current_header.transaction_flag do
+              {:error, :write_conflict}
+            else
+              :ok
+            end
+          {:error, _reason} ->
+            # If we can't parse the header, assume a write conflict occurred
+            {:error, :write_conflict}
+        end
+      {:error, _reason} ->
+        # If we can't read the header, assume a write conflict occurred
+        {:error, :write_conflict}
+    end
+    
+    # Restore file position
+    :file.position(file, current_pos)
+    result
   end
+
 
   defp batch_encode_records(fields, records) do
     batch_encode_records_recursive(fields, records, [])
@@ -1637,8 +1674,10 @@ defmodule Xbase.Parser do
     # Process deletions efficiently by batching file writes
     case batch_write_deletion_flags(file, header, indices) do
       :ok ->
-        # Update header timestamp once for the entire batch
-        updated_header = update_header_timestamp(header)
+        # Update header timestamp and increment transaction flag for conflict detection
+        updated_header = header
+        |> update_header_timestamp()
+        |> increment_transaction_flag()
         case write_header(file, updated_header) do
           :ok ->
             {:ok, %{dbf | header: updated_header}}
