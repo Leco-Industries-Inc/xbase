@@ -8,11 +8,12 @@ defmodule Xbase.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      package: package(),
       
       # Docs
       name: "Xbase",
-      description: "A comprehensive Elixir library for reading, writing, and manipulating dBase database files",
-      source_url: "https://github.com/your-org/xbase",
+      description: "A comprehensive Elixir library for reading, writing, and manipulating xBase database files",
+      source_url: "https://github.com/pcharbon70/xbase",
       homepage_url: "https://github.com/your-org/xbase",
       docs: [
         main: "Xbase",
@@ -48,6 +49,18 @@ defmodule Xbase.MixProject do
   defp deps do
     [
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      maintainers: ["Pasal Charbonneau"],
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => "https://github.com/pcharbon70/xbase",
+        "Changelog" => "https://github.com/pcharbon70/xbase/blob/main/CHANGELOG.md"
+      },
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md)
     ]
   end
 end
